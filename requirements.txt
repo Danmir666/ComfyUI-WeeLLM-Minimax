@@ -1,35 +1,5 @@
 # WeeLLM dependencies
-# Install with: pip install -r requirements.txt
-# Or install:  pip install -e .
-# Or install directly: pip install git+https://github.com/Jit-Roy/weellm
+# WeeLLM handles all core dependencies (diffusers, transformers, accelerate, safetensors etc).
+# We install directly from the GitHub repository.
 
-# Core deep learning
-torch>=2.1.0
-torchvision
-
-# Diffusers + transformers
-diffusers @ git+https://github.com/huggingface/diffusers.git@665f578278365ea4a3318cb8c9b66ce6c01204b9
-# diffusers>=0.37.0
-transformers>=4.50.0
-accelerate>=0.30.0
-
-# Safetensors (fast, memory-mapped model loading)
-safetensors>=0.4.0
-
-# Numerical computing (used by disk/ram seekers)
-numpy>=1.24.0
-
-# Hugging Face model download
-huggingface_hub>=0.20.0
-
-# Image handling
-Pillow>=10.0.0
-
-# Progress bars
-tqdm>=4.65.0
-
-# Memory reporting
-psutil>=5.9.0
-
-# Install the WeeLLM library directly from GitHub
 git+https://github.com/Jit-Roy/weellm.git

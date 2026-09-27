@@ -50,6 +50,14 @@ class WeeLLMLoaderNode:
                 "model_path": ("STRING", {"default": "black-forest-labs/FLUX.1-schnell"}),
                 "task": (["text-to-image", "image-to-image", "video"], {"default": "text-to-image"}),
                 "dtype": (["bfloat16", "float16", "float32"], {"default": "bfloat16"}),
+            },
+            "optional": {
+                "vram_budget": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 128.0, "step": 0.5}),
+                "ram_budget": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 256.0, "step": 0.5}),
+                "text_encoder_path": ("STRING", {"default": ""}),
+                "transformer_path": ("STRING", {"default": ""}),
+                "unet_path": ("STRING", {"default": ""}),
+                "lora_weights": ("STRING", {"default": ""}),
             }
         }
 
@@ -57,19 +65,32 @@ class WeeLLMLoaderNode:
     FUNCTION = "load_pipeline"
     CATEGORY = "WeeLLM"
 
-    def load_pipeline(self, model_path, task, dtype):
+    def load_pipeline(self, model_path, task, dtype, vram_budget=4.0, ram_budget=4.0, 
+                      text_encoder_path="", transformer_path="", unet_path="", lora_weights=""):
         torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[dtype]
 
         if task == "text-to-image":
-            from weellm import WeePipeline as PipelineClass
+            from weellm import WeeTextToImagePipeline as PipelineClass
         elif task == "image-to-image":
-            from weellm import WeeImagePipeline as PipelineClass
+            from weellm import WeeImageToImagePipeline as PipelineClass
         elif task == "video":
             from weellm.weevideopipeline import WeeVideoPipeline as PipelineClass
         else:
             raise ValueError(f"Unknown task: {task}")
 
-        pipe = PipelineClass.from_pretrained(model_path, torch_dtype=torch_dtype)
+        kwargs = {
+            "torch_dtype": torch_dtype,
+            "device": "cuda",
+            "vram_budget": vram_budget,
+            "ram_budget": ram_budget,
+        }
+        
+        if text_encoder_path: kwargs["text_encoder_path"] = text_encoder_path
+        if transformer_path: kwargs["transformer_path"] = transformer_path
+        if unet_path: kwargs["unet_path"] = unet_path
+        if lora_weights: kwargs["lora_weights"] = lora_weights
+
+        pipe = PipelineClass.from_pretrained(model_path, **kwargs)
         return (pipe,)
 
 
@@ -168,7 +189,7 @@ class WeeLLMVideoGenerateNode:
     WeeLLM video generation node.
 
     Outputs a batch of IMAGE frames that you can route to a Video Combine
-    node or inspect frame-by-frame. Works with MiniMax-H3 and any other
+    node or inspect frame-by-frame. Works with MiniMax-H3, LTX-2.5 and any other
     video model WeeLLM supports.
     """
 
@@ -187,6 +208,12 @@ class WeeLLMVideoGenerateNode:
             "optional": {
                 "image":       ("IMAGE",),   # first frame
                 "last_image":  ("IMAGE",),   # last frame (MiniMax FL2VA)
+                "frame_rate":  ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 1.0}),
+                "audio_guidance_scale": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1}),
+                "stg_scale": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1}),
+                "audio_stg_scale": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1}),
+                "modality_scale": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1}),
+                "audio_modality_scale": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1}),
             },
         }
 
@@ -196,10 +223,10 @@ class WeeLLMVideoGenerateNode:
     CATEGORY = "WeeLLM"
 
     def generate(self, pipeline, prompt, height, width, num_frames, num_steps, seed,
-                 image=None, last_image=None):
+                 image=None, last_image=None, frame_rate=24.0, audio_guidance_scale=-1.0,
+                 stg_scale=-1.0, audio_stg_scale=-1.0, modality_scale=-1.0, audio_modality_scale=-1.0):
 
         pipe = pipeline
-
         generator = torch.Generator("cpu").manual_seed(seed)
 
         call_kwargs = dict(
@@ -208,6 +235,7 @@ class WeeLLMVideoGenerateNode:
             num_frames=num_frames,
             num_inference_steps=num_steps,
             generator=generator,
+            frame_rate=frame_rate,
         )
 
         if image is not None:
@@ -215,15 +243,19 @@ class WeeLLMVideoGenerateNode:
 
         if last_image is not None:
             call_kwargs["last_image"] = _pil_from_comfy(last_image)
+            
+        if audio_guidance_scale >= 0: call_kwargs["audio_guidance_scale"] = audio_guidance_scale
+        if stg_scale >= 0: call_kwargs["stg_scale"] = stg_scale
+        if audio_stg_scale >= 0: call_kwargs["audio_stg_scale"] = audio_stg_scale
+        if modality_scale >= 0: call_kwargs["modality_scale"] = modality_scale
+        if audio_modality_scale >= 0: call_kwargs["audio_modality_scale"] = audio_modality_scale
 
         out = pipe(prompt, **call_kwargs)
 
-        # --- Unpack video frames → ComfyUI IMAGE batch --------------------
-        # MiniMax returns decode_state with a "videos" key containing PIL frames
-        # or a tensor of shape [T, C, H, W] / [C, T, H, W].
-        frames_pil = []
-
-        if hasattr(out, "videos") and out.videos is not None:
+        # WeeVideoResult exposes frames (which is a list of PIL Images or a numpy array)
+        if hasattr(out, "frames"):
+            raw = out.frames
+        elif hasattr(out, "videos") and out.videos is not None:
             raw = out.videos[0] if isinstance(out.videos, list) else out.videos
         elif isinstance(out, dict):
             raw = out.get("videos") or out.get("video")
@@ -235,9 +267,16 @@ class WeeLLMVideoGenerateNode:
         if raw is None:
             raise ValueError("WeeVideoPipeline returned no video frames.")
 
+        frames_pil = []
         if isinstance(raw, list):
-            # List of PIL Images
-            frames_pil = [f.convert("RGB") if hasattr(f, "convert") else f for f in raw]
+            # List of PIL Images or numpy arrays
+            for f in raw:
+                if hasattr(f, "convert"):
+                    frames_pil.append(f.convert("RGB"))
+                elif isinstance(f, np.ndarray):
+                    frames_pil.append(Image.fromarray(f, "RGB"))
+                else:
+                    frames_pil.append(f)
         elif isinstance(raw, torch.Tensor):
             # Tensor — normalise to [T, H, W, C] uint8
             v = raw.float()
@@ -257,6 +296,7 @@ class WeeLLMVideoGenerateNode:
 
         gc.collect()
         return (frames_tensor,)
+
 
 
 # ---------------------------------------------------------------------------
