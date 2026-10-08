@@ -1,6 +1,8 @@
 import os
+import re
 import sys
 import gc
+import shutil
 
 # Reduces CUDA memory fragmentation — same flag used in native WeeLLM scripts.
 # Must be set before torch initialises the CUDA allocator.
@@ -12,6 +14,10 @@ from PIL import Image, ImageOps
 
 import comfy.utils
 import comfy.model_management
+import folder_paths
+from server import PromptServer
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +34,97 @@ def _comfy_from_pil(image: Image.Image):
     """Convert a PIL Image → ComfyUI IMAGE tensor [1,H,W,C] float32 0-1."""
     np_img = np.array(image.convert("RGB")).astype(np.float32) / 255.0
     return torch.from_numpy(np_img).unsqueeze(0)
+
+
+def _resolve_weights(path, folder):
+    """Accept a full path or a bare filename living in ComfyUI/models/<folder>."""
+    path = path.strip().strip('"')
+    if path and not os.path.exists(path):
+        return folder_paths.get_full_path(folder, path) or path
+    return path
+
+
+MINIMAX_H3_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "minimax_h3")
+
+
+def _minimax_h3_base_dir():
+    """Assemble the config-only MiniMax-H3 folder WeeLLM expects; weights come from ComfyUI model folders."""
+    base = os.path.join(folder_paths.get_temp_directory(), "weellm_minimax_h3")
+    if os.path.isfile(os.path.join(base, "model_index.json")):
+        return base
+    shutil.copytree(MINIMAX_H3_DIR, base, dirs_exist_ok=True)
+    tokenizer_dir = os.path.join(base, "tokenizer")
+    for name in ("text_encoder", "processor"):
+        shutil.copytree(tokenizer_dir, os.path.join(base, name), dirs_exist_ok=True)
+    processor_dir = os.path.join(base, "processor")
+    for name in ("chat_template.json", "preprocessor_config.json", "video_preprocessor_config.json"):
+        shutil.copy2(os.path.join(base, "text_encoder", name), processor_dir)
+    return base
+
+
+def _diffusers_video_vae(path):
+    """The unsloth MiniMax-H3 video VAE uses the original key layout; convert it once to the diffusers layout WeeLLM loads."""
+    with safe_open(path, "pt") as f:
+        if "decoder.mask_token" not in f.keys():
+            return path
+        converted = os.path.splitext(path)[0] + "_diffusers.safetensors"
+        if os.path.exists(converted):
+            return converted
+        state = {}
+        for key in f.keys():
+            if key in ("decoder.mask_token", "latents_mean", "latents_std"):
+                continue
+            tensor = f.get_tensor(key)
+            m = re.fullmatch(r"decoder\.transformer_blocks\.(\d+)\.(attn\.to_qkv|ff\.w1|ff\.w2|attn\.to_out)\.(weight|bias)", key)
+            if m:
+                prefix, name, suffix = f"decoder.transformer_blocks.{m[1]}.", m[2], m[3]
+                if name == "attn.to_qkv":
+                    heads_qkv = tensor.unflatten(0, (32, 3, 64))
+                    for i, n in enumerate("qkv"):
+                        state[f"{prefix}attn.to_{n}.{suffix}"] = heads_qkv[:, i].flatten(0, 1).contiguous()
+                elif name == "ff.w1":
+                    state[f"{prefix}ff.net.0.proj.{suffix}"] = torch.cat(tensor.chunk(2)[::-1])
+                elif name == "ff.w2":
+                    state[f"{prefix}ff.net.2.{suffix}"] = tensor
+                else:
+                    state[f"{prefix}attn.to_out.0.{suffix}"] = tensor
+                continue
+            key = key.replace("decoder.x_embedder.", "decoder.proj_in.")
+            key = re.sub(r"encoder\.down\.(\d+)\.block\.(\d+)\.", r"encoder.down_blocks.\1.resnets.\2.", key)
+            key = re.sub(r"encoder\.down\.(\d+)\.downsample\.", r"encoder.down_blocks.\1.downsamplers.0.", key)
+            state[key.replace(".nin_shortcut.", ".conv_shortcut.")] = tensor
+        save_file(state, converted + ".tmp", metadata={"format": "pt"})
+    os.replace(converted + ".tmp", converted)
+    return converted
+
+
+def _diffusers_audio_vae(path):
+    """The unsloth MiniMax-H3 audio VAE ships fused conv weights; the model expects weight_norm's weight_g/weight_v."""
+    with safe_open(path, "pt") as f:
+        fused = [k for k in f.keys() if k.startswith(("encoder.", "decoder.")) and k.endswith(".weight") and len(f.get_slice(k).get_shape()) == 3]
+        if not fused:
+            return path
+        converted = os.path.splitext(path)[0] + "_diffusers.safetensors"
+        if os.path.exists(converted):
+            return converted
+        state = {}
+        for key in f.keys():
+            if key in ("latents_mean", "latents_std"):
+                continue
+            tensor = f.get_tensor(key)
+            if key in fused:
+                state[key + "_v"] = tensor
+                state[key + "_g"] = torch.linalg.vector_norm(tensor.float(), dim=(1, 2), keepdim=True).to(tensor.dtype)
+            else:
+                state[key] = tensor
+        save_file(state, converted + ".tmp", metadata={"format": "pt"})
+    os.replace(converted + ".tmp", converted)
+    return converted
+
+
+def _free_pipeline_cache():
+    """Drop ComfyUI's cached node outputs once the prompt ends; WeeLLM pipelines are single-use and keep GBs of host memory."""
+    PromptServer.instance.prompt_queue.set_flag("free_memory", True)
 
 
 def _make_step_callback(pbar: comfy.utils.ProgressBar):
@@ -51,7 +148,7 @@ class WeeLLMLoaderNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_path": ("STRING", {"default": "black-forest-labs/FLUX.1-schnell"}),
+                "model_path": ("STRING", {"default": "black-forest-labs/FLUX.1-schnell", "tooltip": "HF repo id or local folder. Leave empty with task=video to use the bundled MiniMax-H3 configs (weights from transformer_path, vae_path, audio_vae_path and text_encoder_path)"}),
                 "task": (["text-to-image", "image-to-image", "video"], {"default": "text-to-image"}),
                 "dtype": (["bfloat16", "float16", "float32"], {"default": "bfloat16"}),
             },
@@ -63,16 +160,32 @@ class WeeLLMLoaderNode:
                 "unet_path": ("STRING", {"default": ""}),
                 "lora_weights": ("STRING", {"default": ""}),
                 "lora_scale": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05}),
+                "vae_path": ("STRING", {"default": ""}),
+                "audio_vae_path": ("STRING", {"default": ""}),
             }
         }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # WeeLLM offloads the text encoder and transformer to meta after each generation; a cached pipeline can't be reused
+        return float("nan")
 
     RETURN_TYPES = ("WEE_PIPELINE",)
     FUNCTION = "load_pipeline"
     CATEGORY = "WeeLLM"
 
     def load_pipeline(self, model_path, task, dtype, vram_budget=4.0, ram_budget=4.0, 
-                      text_encoder_path="", transformer_path="", unet_path="", lora_weights="", lora_scale=1.0):
+                      text_encoder_path="", transformer_path="", unet_path="", lora_weights="", lora_scale=1.0,
+                      vae_path="", audio_vae_path=""):
         torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[dtype]
+
+        model_path = model_path.strip().strip('"')
+        if not model_path:
+            if task != "video":
+                raise ValueError("Empty model_path is only supported with task=video (bundled MiniMax-H3 configs)")
+            model_path = _minimax_h3_base_dir()
+        elif (os.path.isabs(model_path) or "\\" in model_path) and not os.path.isdir(model_path):
+            raise FileNotFoundError(f"Local model folder not found: '{model_path}'")
 
         if task == "text-to-image":
             from weellm import WeeTextToImagePipeline as PipelineClass
@@ -90,9 +203,11 @@ class WeeLLMLoaderNode:
             "ram_budget": ram_budget,
         }
         
-        if text_encoder_path: kwargs["text_encoder_path"] = text_encoder_path
-        if transformer_path: kwargs["transformer_path"] = transformer_path
-        if unet_path: kwargs["unet_path"] = unet_path
+        if text_encoder_path: kwargs["text_encoder_path"] = _resolve_weights(text_encoder_path, "text_encoders")
+        if transformer_path: kwargs["transformer_path"] = _resolve_weights(transformer_path, "diffusion_models")
+        if unet_path: kwargs["unet_path"] = _resolve_weights(unet_path, "diffusion_models")
+        if vae_path: kwargs["vae_path"] = _diffusers_video_vae(_resolve_weights(vae_path, "vae"))
+        if audio_vae_path: kwargs["audio_vae_path"] = _diffusers_audio_vae(_resolve_weights(audio_vae_path, "vae"))
         if lora_weights: 
             kwargs["lora_weights"] = lora_weights
             kwargs["lora_scale"] = lora_scale
@@ -185,6 +300,7 @@ class WeeLLMGenerateNode:
             else:
                 raise ValueError(f"Unexpected generate() return type: {type(result)}")
 
+        _free_pipeline_cache()
         return (_comfy_from_pil(result),)
 
 
@@ -311,6 +427,7 @@ class WeeLLMVideoGenerateNode:
         frames_tensor = torch.cat(frame_tensors, dim=0)   # [T, H, W, C]
 
         gc.collect()
+        _free_pipeline_cache()
         return (frames_tensor,)
 
 
