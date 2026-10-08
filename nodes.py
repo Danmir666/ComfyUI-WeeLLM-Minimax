@@ -136,6 +136,45 @@ def _make_step_callback(pbar: comfy.utils.ProgressBar):
     return _cb
 
 
+class _MultiLoRA:
+    """WeeLLM streamers hold a single lora_loader; apply several in sequence through it."""
+    def __init__(self, loaders):
+        self.loaders = loaders
+
+    def apply_to_module(self, module, shard_name):
+        for loader in self.loaders:
+            loader.apply_to_module(module, shard_name)
+
+
+# ---------------------------------------------------------------------------
+# Node 0: WeeLLM LoRA (chainable)
+# ---------------------------------------------------------------------------
+
+class WeeLLMLoraNode:
+    """
+    Adds one LoRA from ComfyUI/models/loras to a list. Chain several of these into the Loader's `loras` input.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "lora_name": (folder_paths.get_filename_list("loras"),),
+                "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05}),
+            },
+            "optional": {
+                "loras": ("WEE_LORAS",),
+            }
+        }
+
+    RETURN_TYPES = ("WEE_LORAS",)
+    FUNCTION = "add_lora"
+    CATEGORY = "WeeLLM"
+
+    def add_lora(self, lora_name, strength, loras=None):
+        path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        return ((loras or []) + [(path, strength)],)
+
+
 # ---------------------------------------------------------------------------
 # Node 1: WeeLLM Loader
 # ---------------------------------------------------------------------------
@@ -162,6 +201,7 @@ class WeeLLMLoaderNode:
                 "lora_scale": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05}),
                 "vae_path": ("STRING", {"default": ""}),
                 "audio_vae_path": ("STRING", {"default": ""}),
+                "loras": ("WEE_LORAS",),
             }
         }
 
@@ -176,7 +216,7 @@ class WeeLLMLoaderNode:
 
     def load_pipeline(self, model_path, task, dtype, vram_budget=4.0, ram_budget=4.0, 
                       text_encoder_path="", transformer_path="", unet_path="", lora_weights="", lora_scale=1.0,
-                      vae_path="", audio_vae_path=""):
+                      vae_path="", audio_vae_path="", loras=None):
         torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[dtype]
 
         model_path = model_path.strip().strip('"')
@@ -208,11 +248,16 @@ class WeeLLMLoaderNode:
         if unet_path: kwargs["unet_path"] = _resolve_weights(unet_path, "diffusion_models")
         if vae_path: kwargs["vae_path"] = _diffusers_video_vae(_resolve_weights(vae_path, "vae"))
         if audio_vae_path: kwargs["audio_vae_path"] = _diffusers_audio_vae(_resolve_weights(audio_vae_path, "vae"))
-        if lora_weights: 
-            kwargs["lora_weights"] = lora_weights
-            kwargs["lora_scale"] = lora_scale
 
         pipe = PipelineClass.from_pretrained(model_path, **kwargs)
+
+        loras = list(loras or [])
+        if lora_weights:
+            loras.append((_resolve_weights(lora_weights, "loras"), lora_scale))
+        if loras:
+            from weellm.models.loras.lora_streamer import GenericLazyLoRALoader
+            transformer = getattr(pipe._pipeline, "transformer", None) or pipe._pipeline.unet
+            transformer._weellm_streamer.lora_loader = _MultiLoRA([GenericLazyLoRALoader(path, scale=strength) for path, strength in loras])
         return (pipe,)
 
 
@@ -437,12 +482,14 @@ class WeeLLMVideoGenerateNode:
 # ---------------------------------------------------------------------------
 
 NODE_CLASS_MAPPINGS = {
+    "WeeLLMLoraNode":          WeeLLMLoraNode,
     "WeeLLMLoaderNode":        WeeLLMLoaderNode,
     "WeeLLMGenerateNode":      WeeLLMGenerateNode,
     "WeeLLMVideoGenerateNode": WeeLLMVideoGenerateNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "WeeLLMLoraNode":          "WeeLLM LoRA",
     "WeeLLMLoaderNode":        "WeeLLM Loader",
     "WeeLLMGenerateNode":      "WeeLLM Generate",
     "WeeLLMVideoGenerateNode": "WeeLLM Video Generate",
