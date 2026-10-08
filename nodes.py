@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 import sys
 import gc
 import shutil
@@ -386,8 +387,8 @@ class WeeLLMVideoGenerateNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("frames",)
+    RETURN_TYPES = ("IMAGE", "AUDIO")
+    RETURN_NAMES = ("frames", "audio")
     FUNCTION = "generate"
     CATEGORY = "WeeLLM"
 
@@ -471,9 +472,18 @@ class WeeLLMVideoGenerateNode:
         frame_tensors = [_comfy_from_pil(f) for f in frames_pil]
         frames_tensor = torch.cat(frame_tensors, dim=0)   # [T, H, W, C]
 
+        waveform, sample_rate = getattr(out, "audio", None), getattr(out, "audio_rate", 32000)
+        if isinstance(waveform, torch.Tensor):
+            waveform = waveform.float().cpu()
+            if waveform.ndim < 3:
+                waveform = waveform.reshape(1, -1, waveform.shape[-1])
+        else:
+            logging.warning("WeeLLM returned no audio; the audio output is silent.")
+            waveform = torch.zeros(1, 2, int(sample_rate * frames_tensor.shape[0] / frame_rate))
+
         gc.collect()
         _free_pipeline_cache()
-        return (frames_tensor,)
+        return (frames_tensor, {"waveform": waveform, "sample_rate": sample_rate})
 
 
 

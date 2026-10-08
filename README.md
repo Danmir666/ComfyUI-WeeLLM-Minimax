@@ -64,10 +64,14 @@ pip install -r requirements.txt
 ## Nodes
 
 ### 1. WeeLLM Loader
-Responsible for configuring and caching the model pipeline. 
-- **`model_path`**: Provide the Hugging Face repo ID (e.g. `black-forest-labs/FLUX.1-schnell`) or a local directory.
+Responsible for configuring and building the model pipeline. The pipeline is rebuilt on every queue, because WeeLLM offloads the text encoder and transformer after each generation.
+- **`model_path`**: Hugging Face repo ID (e.g. `black-forest-labs/FLUX.1-schnell`) or a local directory. Leave it empty with `task = video` to use the bundled MiniMax-H3 configs (see [MiniMax-H3](#minimax-h3)).
 - **`task`**: Select the type of pipeline to initialize (`text-to-image`, `image-to-image`, `video`).
 - **`dtype`**: The precision to use (e.g., `bfloat16`).
+- **`vram_budget` / `ram_budget`**: GB the streamer may use on the GPU and in system RAM. A larger `vram_budget` keeps more blocks cached on the GPU; a larger `ram_budget` prefetches more blocks from disk. `0` is a zero budget, not automatic.
+- **`text_encoder_path`, `transformer_path`, `unet_path`, `vae_path`, `audio_vae_path`**: Weight overrides. Pass a full path or just a file name; names are looked up in `models/text_encoders`, `models/diffusion_models` and `models/vae`.
+- **`loras`**: A list built with [WeeLLM LoRA](#4-weellm-lora) nodes.
+- **`lora_weights` / `lora_scale`**: A single extra LoRA, kept for older workflows. A bare file name is looked up in `models/loras`.
 
 ### 2. WeeLLM Generate
 Generates images using the loaded pipeline.
@@ -75,6 +79,30 @@ Generates images using the loaded pipeline.
 - Supports optional **`image`** and **`mask_image`** inputs for automatic Image-to-Image and Inpainting.
 
 ### 3. WeeLLM Video Generate
-Generates video batches for models like MiniMax-H3 FL2VA.
+Generates video for models like MiniMax-H3 FL2VA.
 - Connect the `WEE_PIPELINE` from the Loader (with `video` task selected) to this node.
-- Outputs an `IMAGE` batch that can be sent directly to Video Combine nodes.
+- Outputs `frames` (an `IMAGE` batch) and `audio` (`AUDIO`, stereo 32 kHz for MiniMax-H3). Connect both to **Create Video**, set its `fps` to this node's `frame_rate`, then to **Save Video** to get an MP4 with sound. If WeeLLM returns no audio, the output is silent and a warning is logged.
+- `audio_guidance_scale`, `stg_scale`, `audio_stg_scale`, `modality_scale` and `audio_modality_scale` are LTX-2 guidance controls. MiniMax-H3 is guidance-distilled and does not use them.
+
+### 4. WeeLLM LoRA
+Adds one LoRA from `models/loras` to a list. Chain as many as needed and connect the last one to the Loader's `loras` input.
+- **`lora_name`** / **`strength`**: The LoRA file and its scale.
+- **`loras`** (optional): The list from a previous WeeLLM LoRA node.
+- LoRAs are applied in order while each block is streamed from disk, so every extra LoRA adds some time per block. WeeLLM skips (and warns about) LoRA keys that do not exist in the model, so use LoRAs trained for the loaded architecture.
+
+## MiniMax-H3
+
+The MiniMax-H3 configs and tokenizer are bundled in `minimax_h3/`, so no Hugging Face repo is needed. Weights come from the usual ComfyUI folders.
+
+| Loader input | File | Folder |
+|---|---|---|
+| `model_path` | empty | |
+| `task` | `video` | |
+| `transformer_path` | `minimax_h3_fl2va_pruned-*.gguf` ([unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)) | `models/diffusion_models` |
+| `text_encoder_path` | `qwen3vl_32b_minimax_h3-*.gguf` | `models/text_encoders` |
+| `vae_path` | `minimax_h3_video_vae_fp16.safetensors` | `models/vae` |
+| `audio_vae_path` | `minimax_h3_audio_vae_fp32.safetensors` | `models/vae` |
+
+- The unsloth VAEs use the original MiniMax key layout. On first use they are converted next to the original as `*_diffusers.safetensors` (about 5.8 GB in total) and reused afterwards. The originals can be deleted once the converted files exist; point the Loader at the `_diffusers` names.
+- ComfyUI-native quantized checkpoints (for example W4A8 `blocks.N.attn.qkv_proj` files) cannot be loaded by WeeLLM. Use the GGUF transformers.
+- The Generate nodes ask ComfyUI to free its node cache when a prompt ends, because a WeeLLM pipeline keeps several GB of host memory and cannot be reused. Other cached nodes in the workflow run again on the next queue.
