@@ -105,4 +105,5 @@ The MiniMax-H3 configs and tokenizer are bundled in `minimax_h3/`, so no Hugging
 
 - The unsloth VAEs use the original MiniMax key layout. On first use they are converted next to the original as `*_diffusers.safetensors` (about 5.8 GB in total) and reused afterwards. The originals can be deleted once the converted files exist; point the Loader at the `_diffusers` names.
 - ComfyUI-native quantized checkpoints (for example W4A8 `blocks.N.attn.qkv_proj` files) cannot be loaded by WeeLLM. Use the GGUF transformers.
+- On cards with 6 GB of VRAM the Loader patches WeeLLM's MiniMax VAE decode in memory: micro-batches are sized for the real per-tile cost (~14x a tile's bytes, WeeLLM assumes ~5x) and the decoded tiles are stitched in system RAM instead of VRAM. This needs a few GB of free RAM while the video is assembled. If a future WeeLLM release changes that code, the patch is skipped and a warning is logged.
 - The Generate nodes ask ComfyUI to free its node cache when a prompt ends, because a WeeLLM pipeline keeps several GB of host memory and cannot be reused. Other cached nodes in the workflow run again on the next queue.

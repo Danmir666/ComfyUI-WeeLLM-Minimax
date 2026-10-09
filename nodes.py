@@ -1,9 +1,11 @@
 import os
 import re
+import inspect
 import logging
 import sys
 import gc
 import shutil
+import textwrap
 
 # Reduces CUDA memory fragmentation — same flag used in native WeeLLM scripts.
 # Must be set before torch initialises the CUDA allocator.
@@ -128,6 +130,40 @@ def _free_pipeline_cache():
     PromptServer.instance.prompt_queue.set_flag("free_memory", True)
 
 
+def _patch_vae_decode():
+    """MiniMax VAE decode on 6 GB cards: size micro-batches for the real per-tile cost (~14x, WeeLLM assumes ~5x) and stitch the decoded tiles in RAM instead of VRAM."""
+    from weellm.models.vaes.autoencoder_kl_minimax_h3 import AutoencoderKLMiniMaxH3Streamer
+    module = sys.modules[AutoencoderKLMiniMaxH3Streamer.__module__]
+    if getattr(AutoencoderKLMiniMaxH3Streamer, "_decode_patched", False):
+        return
+    source = textwrap.dedent(inspect.getsource(AutoencoderKLMiniMaxH3Streamer._stream_decode))
+    gpu_tiles = "t.unsqueeze(0).to(self.device, non_blocking=True) for t in all_hs.unbind(dim=0)"
+    if gpu_tiles not in source:
+        logging.warning("WeeLLM's VAE decode changed; decoded tiles will be stitched in VRAM.")
+        stream_decode = AutoencoderKLMiniMaxH3Streamer._stream_decode
+    else:
+        namespace = {}
+        exec(source.replace(gpu_tiles, "t.unsqueeze(0) for t in all_hs.unbind(dim=0)"), vars(module), namespace)
+        stream_decode = namespace["_stream_decode"]
+
+    def _stream_decode(self, z):
+        mem_get_info = torch.cuda.mem_get_info
+        reserve = 0.6e9
+
+        def capped(*args, **kwargs):
+            free, total = mem_get_info(*args, **kwargs)
+            return reserve + max(0, free - reserve) * 5 / 14, total
+
+        torch.cuda.mem_get_info = capped
+        try:
+            return stream_decode(self, z)
+        finally:
+            torch.cuda.mem_get_info = mem_get_info
+
+    AutoencoderKLMiniMaxH3Streamer._stream_decode = _stream_decode
+    AutoencoderKLMiniMaxH3Streamer._decode_patched = True
+
+
 def _make_step_callback(pbar: comfy.utils.ProgressBar):
     """Return a diffusers callback_on_step_end that ticks the bar and honours cancel."""
     def _cb(pipeline, step_index, timestep, callback_kwargs):
@@ -225,6 +261,7 @@ class WeeLLMLoaderNode:
             if task != "video":
                 raise ValueError("Empty model_path is only supported with task=video (bundled MiniMax-H3 configs)")
             model_path = _minimax_h3_base_dir()
+            _patch_vae_decode()
         elif (os.path.isabs(model_path) or "\\" in model_path) and not os.path.isdir(model_path):
             raise FileNotFoundError(f"Local model folder not found: '{model_path}'")
 
@@ -428,7 +465,11 @@ class WeeLLMVideoGenerateNode:
         comfy.model_management.soft_empty_cache()
         gc.collect()
 
-        out = pipe(prompt, **call_kwargs)
+        try:
+            out = pipe(prompt, **call_kwargs)
+        except BaseException:
+            _free_pipeline_cache()
+            raise
 
         # WeeVideoResult exposes frames (which is a list of PIL Images or a numpy array)
         if hasattr(out, "frames"):
