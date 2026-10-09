@@ -81,7 +81,8 @@ Generates images using the loaded pipeline.
 ### 3. WeeLLM Video Generate
 Generates video for models like MiniMax-H3 FL2VA.
 - Connect the `WEE_PIPELINE` from the Loader (with `video` task selected) to this node.
-- Outputs `frames` (an `IMAGE` batch) and `audio` (`AUDIO`, stereo 32 kHz for MiniMax-H3). Connect both to **Create Video**, set its `fps` to this node's `frame_rate`, then to **Save Video** to get an MP4 with sound. If WeeLLM returns no audio, the output is silent and a warning is logged.
+- Outputs `frames` (an `IMAGE` batch), `audio` (`AUDIO`, stereo 32 kHz for MiniMax-H3) and `latent` (`LATENT`, MiniMax-H3 only). Connect both to **Create Video**, set its `fps` to this node's `frame_rate`, then to **Save Video** to get an MP4 with sound. If WeeLLM returns no audio, the output is silent and a warning is logged.
+- **`decode_frames`**: turn it off to skip the VAE decode, the slowest step. `frames` is then a 1-frame placeholder and `latent` is what matters.
 - `audio_guidance_scale`, `stg_scale`, `audio_stg_scale`, `modality_scale` and `audio_modality_scale` are LTX-2 guidance controls. MiniMax-H3 is guidance-distilled and does not use them.
 
 ### 4. WeeLLM LoRA
@@ -89,6 +90,9 @@ Adds one LoRA from `models/loras` to a list. Chain as many as needed and connect
 - **`lora_name`** / **`strength`**: The LoRA file and its scale.
 - **`loras`** (optional): The list from a previous WeeLLM LoRA node.
 - LoRAs are applied in order while each block is streamed from disk, so every extra LoRA adds some time per block. WeeLLM skips (and warns about) LoRA keys that do not exist in the model, so use LoRAs trained for the loaded architecture.
+
+### 5. WeeLLM Latent Decode
+Decodes a MiniMax-H3 `LATENT` into `frames` with the loaded pipeline's streamed VAE. Connect the same `WEE_PIPELINE` that produced the latent.
 
 ## MiniMax-H3
 
@@ -107,3 +111,12 @@ The MiniMax-H3 configs and tokenizer are bundled in `minimax_h3/`, so no Hugging
 - ComfyUI-native quantized checkpoints (for example W4A8 `blocks.N.attn.qkv_proj` files) cannot be loaded by WeeLLM. Use the GGUF transformers.
 - On cards with 6 GB of VRAM the Loader patches WeeLLM's MiniMax VAE decode in memory: micro-batches are sized for the real per-tile cost (~14x a tile's bytes, WeeLLM assumes ~5x) and the decoded tiles are stitched in system RAM instead of VRAM. This needs a few GB of free RAM while the video is assembled. If a future WeeLLM release changes that code, the patch is skipped and a warning is logged.
 - The Generate nodes ask ComfyUI to free its node cache when a prompt ends, because a WeeLLM pipeline keeps several GB of host memory and cannot be reused. Other cached nodes in the workflow run again on the next queue.
+
+### Latent upscaling with the H3 Latent Upscaler
+
+`WeeLLM Video Generate` outputs the video latent in VAE space, the space the Comfyui_Minimax_h3_latent_Upscaler nodes work in. Chain:
+
+`WeeLLM Video Generate` (`decode_frames` off) -> `latent` -> **Minimax H3 Latent Upscaler (3D)** -> **WeeLLM Latent Decode** -> `frames` -> **Create Video** (use the `audio` output of Video Generate).
+
+- WeeLLM has no refine pass, so this is the "quick preview" chain: the latent is enlarged and decoded, not re-sampled.
+- Decoding scales with the upscaled area: tiles grow roughly with the square of the scale. Each tile takes about 15 MB of pinned RAM plus about 22 MB once decoded, so a 209-frame video enlarged 1.5x needs roughly 9 GB of RAM and 2x more than 16 GB (estimates). Use a modest scale or fewer frames if RAM runs out.

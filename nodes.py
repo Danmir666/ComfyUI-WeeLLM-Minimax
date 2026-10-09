@@ -130,6 +130,10 @@ def _free_pipeline_cache():
     PromptServer.instance.prompt_queue.set_flag("free_memory", True)
 
 
+# Filled by the patched VAE decode while a video generation runs: the video latent (VAE space) and whether to skip decoding it
+_decode_capture = {"active": False, "skip": False, "latent": None}
+
+
 def _patch_vae_decode():
     """MiniMax VAE decode on 6 GB cards: size micro-batches for the real per-tile cost (~14x, WeeLLM assumes ~5x) and stitch the decoded tiles in RAM instead of VRAM."""
     from weellm.models.vaes.autoencoder_kl_minimax_h3 import AutoencoderKLMiniMaxH3Streamer
@@ -160,7 +164,18 @@ def _patch_vae_decode():
         finally:
             torch.cuda.mem_get_info = mem_get_info
 
+    decode = AutoencoderKLMiniMaxH3Streamer.decode
+
+    def capture_decode(self, latents, return_dict=True, **kwargs):
+        if _decode_capture["active"] and not self.is_audio:
+            _decode_capture["latent"] = latents.detach().float().cpu()
+            if _decode_capture["skip"]:
+                placeholder = torch.zeros(1, 3, 1, 16, 16, device=latents.device)
+                return placeholder if return_dict else (placeholder,)
+        return decode(self, latents, return_dict, **kwargs)
+
     AutoencoderKLMiniMaxH3Streamer._stream_decode = _stream_decode
+    AutoencoderKLMiniMaxH3Streamer.decode = capture_decode
     AutoencoderKLMiniMaxH3Streamer._decode_patched = True
 
 
@@ -416,6 +431,7 @@ class WeeLLMVideoGenerateNode:
                 "first_frame": ("IMAGE",),   # first frame
                 "last_frame":  ("IMAGE",),   # last frame (MiniMax FL2VA)
                 "frame_rate":  ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 1.0}),
+                "decode_frames": ("BOOLEAN", {"default": True, "tooltip": "Off skips the VAE decode (the slowest step); frames is then a 1-frame placeholder and only latent is meaningful"}),
                 "audio_guidance_scale": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1}),
                 "stg_scale": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1}),
                 "audio_stg_scale": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1}),
@@ -424,14 +440,15 @@ class WeeLLMVideoGenerateNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("frames", "audio")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "LATENT")
+    RETURN_NAMES = ("frames", "audio", "latent")
     FUNCTION = "generate"
     CATEGORY = "WeeLLM"
 
     def generate(self, pipeline, prompt, height, width, num_frames, num_steps, seed,
                  first_frame=None, last_frame=None, frame_rate=24.0, audio_guidance_scale=-1.0,
-                 stg_scale=-1.0, audio_stg_scale=-1.0, modality_scale=-1.0, audio_modality_scale=-1.0):
+                 stg_scale=-1.0, audio_stg_scale=-1.0, modality_scale=-1.0, audio_modality_scale=-1.0,
+                 decode_frames=True):
 
         pipe = pipeline
         generator = torch.Generator("cpu").manual_seed(seed)
@@ -465,11 +482,17 @@ class WeeLLMVideoGenerateNode:
         comfy.model_management.soft_empty_cache()
         gc.collect()
 
+        _decode_capture.update(active=True, skip=not decode_frames, latent=None)
         try:
             out = pipe(prompt, **call_kwargs)
         except BaseException:
             _free_pipeline_cache()
             raise
+        finally:
+            _decode_capture["active"] = False
+        latent = _decode_capture["latent"]
+        if latent is None and not decode_frames:
+            raise ValueError("No video latent was captured; latent output needs the bundled MiniMax-H3 setup (empty model_path)")
 
         # WeeVideoResult exposes frames (which is a list of PIL Images or a numpy array)
         if hasattr(out, "frames"):
@@ -524,7 +547,7 @@ class WeeLLMVideoGenerateNode:
 
         gc.collect()
         _free_pipeline_cache()
-        return (frames_tensor, {"waveform": waveform, "sample_rate": sample_rate})
+        return (frames_tensor, {"waveform": waveform, "sample_rate": sample_rate}, None if latent is None else {"samples": latent})
 
 
 
@@ -532,11 +555,55 @@ class WeeLLMVideoGenerateNode:
 # Registration
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Node 4: WeeLLM Latent Decode (MiniMax-H3)
+# ---------------------------------------------------------------------------
+
+class WeeLLMLatentDecodeNode:
+    """
+    Decodes a MiniMax-H3 video latent (for example the output of the H3 Latent Upscaler) with the loaded
+    pipeline's streamed VAE. Connect the same pipeline that produced the latent.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pipeline": ("WEE_PIPELINE",),
+                "latent": ("LATENT",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("frames",)
+    FUNCTION = "decode"
+    CATEGORY = "WeeLLM"
+
+    def decode(self, pipeline, latent):
+        from weellm.io.memory import evict_module
+
+        underlying = pipeline._pipeline
+        transformer = underlying.transformer
+        evict_module(transformer)
+        transformer._weellm_streamer._resident_loaded = False
+
+        streamer = underlying.vae_streamer
+        with torch.no_grad():
+            video = streamer._stream_decode(latent["samples"].to(streamer.device, streamer.dtype))
+        pixel_mean = torch.tensor(underlying.pixel_mean).view(1, -1, 1, 1, 1)
+        pixel_std = torch.tensor(underlying.pixel_std).view(1, -1, 1, 1, 1)
+        frames = (video.float().cpu() * pixel_std + pixel_mean).clamp(0, 1)[0].permute(1, 2, 3, 0).contiguous()
+
+        gc.collect()
+        _free_pipeline_cache()
+        return (frames,)
+
+
 NODE_CLASS_MAPPINGS = {
     "WeeLLMLoraNode":          WeeLLMLoraNode,
     "WeeLLMLoaderNode":        WeeLLMLoaderNode,
     "WeeLLMGenerateNode":      WeeLLMGenerateNode,
     "WeeLLMVideoGenerateNode": WeeLLMVideoGenerateNode,
+    "WeeLLMLatentDecodeNode":  WeeLLMLatentDecodeNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -544,4 +611,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WeeLLMLoaderNode":        "WeeLLM Loader",
     "WeeLLMGenerateNode":      "WeeLLM Generate",
     "WeeLLMVideoGenerateNode": "WeeLLM Video Generate",
+    "WeeLLMLatentDecodeNode":  "WeeLLM Latent Decode",
 }
