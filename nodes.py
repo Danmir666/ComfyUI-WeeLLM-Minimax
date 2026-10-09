@@ -433,7 +433,7 @@ class WeeLLMVideoGenerateNode:
                 "first_frame": ("IMAGE",),   # first frame
                 "last_frame":  ("IMAGE",),   # last frame (MiniMax FL2VA)
                 "frame_rate":  ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 1.0}),
-                "decode_frames": ("BOOLEAN", {"default": True, "tooltip": "Off skips the VAE decode (the slowest step); frames is then a 1-frame placeholder and only latent is meaningful"}),
+                "decode_frames": ("BOOLEAN", {"default": True, "tooltip": "Chooses ONE output, never both (outputting both can run out of memory).\nOn: decodes the video. Use frames (and audio) to preview or save it; latent stays empty.\nOff: skips the slow VAE decode. Use latent with the H3 Latent Upscaler and WeeLLM Latent Decode to scale the video; frames is then a 1-frame placeholder.\nSwitching modes runs the generation again (same seed, same prompt)."}),
                 "audio_guidance_scale": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1}),
                 "stg_scale": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1}),
                 "audio_stg_scale": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1}),
@@ -484,7 +484,7 @@ class WeeLLMVideoGenerateNode:
         comfy.model_management.soft_empty_cache()
         gc.collect()
 
-        _decode_capture.update(active=True, skip=not decode_frames, latent=None)
+        _decode_capture.update(active=not decode_frames, skip=True, latent=None)
         try:
             out = pipe(prompt, **call_kwargs)
         except BaseException:

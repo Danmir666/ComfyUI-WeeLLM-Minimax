@@ -82,7 +82,7 @@ Generates images using the loaded pipeline.
 Generates video for models like MiniMax-H3 FL2VA.
 - Connect the `WEE_PIPELINE` from the Loader (with `video` task selected) to this node.
 - Outputs `frames` (an `IMAGE` batch), `audio` (`AUDIO`, stereo 32 kHz for MiniMax-H3) and `latent` (`LATENT`, MiniMax-H3 only). Connect both to **Create Video**, set its `fps` to this node's `frame_rate`, then to **Save Video** to get an MP4 with sound. If WeeLLM returns no audio, the output is silent and a warning is logged.
-- **`decode_frames`**: turn it off to skip the VAE decode, the slowest step. `frames` is then a 1-frame placeholder and `latent` is what matters.
+- **`decode_frames`**: picks one output, never both, since producing both can run out of memory. On (default): the video is decoded and `frames` is the result, `latent` stays empty. Off: the VAE decode is skipped, `latent` is the result and `frames` is a 1-frame placeholder. Switching modes generates the video again.
 - `audio_guidance_scale`, `stg_scale`, `audio_stg_scale`, `modality_scale` and `audio_modality_scale` are LTX-2 guidance controls. MiniMax-H3 is guidance-distilled and does not use them.
 
 ### 4. WeeLLM LoRA
@@ -116,7 +116,7 @@ The MiniMax-H3 configs and tokenizer are bundled in `minimax_h3/`, so no Hugging
 
 `WeeLLM Video Generate` outputs the video latent normalized the way ComfyUI's native MiniMax-H3 `LATENT` is (the VAE adds the per-channel mean and std back when decoding), which is what the Comfyui_Minimax_h3_latent_Upscaler nodes expect. Chain:
 
-`WeeLLM Video Generate` (`decode_frames` off) -> `latent` -> **Minimax H3 Latent Upscaler (3D)** -> **WeeLLM Latent Decode** -> `frames` -> **Create Video** (use the `audio` output of Video Generate).
+Preview with `decode_frames` on (use `frames` and `audio`). Once the video is as wanted, switch `decode_frames` off and chain: `WeeLLM Video Generate` -> `latent` -> **Minimax H3 Latent Upscaler (3D)** -> **WeeLLM Latent Decode** -> `frames` -> **Create Video** (use the `audio` output of Video Generate).
 
 - WeeLLM has no refine pass, so this is the "quick preview" chain: the latent is enlarged and decoded, not re-sampled.
 - Decoding scales with the upscaled area: tiles grow roughly with the square of the scale. Each tile takes about 15 MB of pinned RAM plus about 22 MB once decoded, so a 209-frame video enlarged 1.5x needs roughly 9 GB of RAM and 2x more than 16 GB (estimates). Use a modest scale or fewer frames if RAM runs out.
