@@ -130,7 +130,7 @@ def _free_pipeline_cache():
     PromptServer.instance.prompt_queue.set_flag("free_memory", True)
 
 
-# Filled by the patched VAE decode while a video generation runs: the video latent (VAE space) and whether to skip decoding it
+# Filled by the patched VAE decode while a video generation runs: the normalized video latent (ComfyUI's H3 LATENT convention) and whether to skip decoding it
 _decode_capture = {"active": False, "skip": False, "latent": None}
 
 
@@ -168,7 +168,9 @@ def _patch_vae_decode():
 
     def capture_decode(self, latents, return_dict=True, **kwargs):
         if _decode_capture["active"] and not self.is_audio:
-            _decode_capture["latent"] = latents.detach().float().cpu()
+            mean = torch.tensor(self.model.config.latents_mean).view(1, -1, 1, 1, 1)
+            std = torch.tensor(self.model.config.latents_std).view(1, -1, 1, 1, 1)
+            _decode_capture["latent"] = (latents.detach().float().cpu() - mean) / std
             if _decode_capture["skip"]:
                 placeholder = torch.zeros(1, 3, 1, 16, 16, device=latents.device)
                 return placeholder if return_dict else (placeholder,)
@@ -587,8 +589,11 @@ class WeeLLMLatentDecodeNode:
         transformer._weellm_streamer._resident_loaded = False
 
         streamer = underlying.vae_streamer
+        config = streamer.model.config
+        mean = torch.tensor(config.latents_mean).view(1, -1, 1, 1, 1)
+        std = torch.tensor(config.latents_std).view(1, -1, 1, 1, 1)
         with torch.no_grad():
-            video = streamer._stream_decode(latent["samples"].to(streamer.device, streamer.dtype))
+            video = streamer._stream_decode((latent["samples"].float().cpu() * std + mean).to(streamer.device, streamer.dtype))
         pixel_mean = torch.tensor(underlying.pixel_mean).view(1, -1, 1, 1, 1)
         pixel_std = torch.tensor(underlying.pixel_std).view(1, -1, 1, 1, 1)
         frames = (video.float().cpu() * pixel_std + pixel_mean).clamp(0, 1)[0].permute(1, 2, 3, 0).contiguous()

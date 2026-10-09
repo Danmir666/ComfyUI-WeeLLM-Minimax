@@ -114,7 +114,7 @@ The MiniMax-H3 configs and tokenizer are bundled in `minimax_h3/`, so no Hugging
 
 ### Latent upscaling with the H3 Latent Upscaler
 
-`WeeLLM Video Generate` outputs the video latent in VAE space, the space the Comfyui_Minimax_h3_latent_Upscaler nodes work in. Chain:
+`WeeLLM Video Generate` outputs the video latent normalized the way ComfyUI's native MiniMax-H3 `LATENT` is (the VAE adds the per-channel mean and std back when decoding), which is what the Comfyui_Minimax_h3_latent_Upscaler nodes expect. Chain:
 
 `WeeLLM Video Generate` (`decode_frames` off) -> `latent` -> **Minimax H3 Latent Upscaler (3D)** -> **WeeLLM Latent Decode** -> `frames` -> **Create Video** (use the `audio` output of Video Generate).
 
