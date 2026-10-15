@@ -21,6 +21,11 @@ import folder_paths
 from server import PromptServer
 from safetensors import safe_open
 from safetensors.torch import save_file
+from huggingface_hub import constants as hf_constants
+
+# Keep Hugging Face downloads in ComfyUI's models/diffusers instead of the user profile, unless HF_HUB_CACHE is set.
+if "HF_HUB_CACHE" not in os.environ:
+    hf_constants.HF_HUB_CACHE = folder_paths.get_folder_paths("diffusers")[0]
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +135,17 @@ def _free_pipeline_cache():
     PromptServer.instance.prompt_queue.set_flag("free_memory", True)
 
 
+def _release_gpu(pipeline=None):
+    """Hand the GPU back before the next node: ComfyUI's models do not know about WeeLLM's tensors, so an upscaler loading after us would otherwise compete with them."""
+    if pipeline is not None:
+        from weellm.io.memory import evict_module
+        transformer = pipeline._pipeline.transformer
+        evict_module(transformer)
+        transformer._weellm_streamer._resident_loaded = False
+    gc.collect()
+    comfy.model_management.soft_empty_cache()
+
+
 # Filled by the patched VAE decode while a video generation runs: the normalized video latent (ComfyUI's H3 LATENT convention) and whether to skip decoding it
 _decode_capture = {"active": False, "skip": False, "latent": None}
 
@@ -198,6 +214,72 @@ class _MultiLoRA:
     def apply_to_module(self, module, shard_name):
         for loader in self.loaders:
             loader.apply_to_module(module, shard_name)
+
+
+class _PrunedAdalnLoRA:
+    """Pruned H3 bases take an 8-dim table row in adaln_proj.linear, but LoRAs such as the Turbo one carry the adaln delta in the 2688-dim silu(t_emb) space. Apply the other tensors through the wrapped loader and add B @ A @ silu(t_emb) to those projections at run time, reading silu(t_emb) from the grid bundled with ComfyUI-MiniMax-H3-Turbo."""
+    GRID_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ComfyUI-MiniMax-H3-Turbo", "h3_silu_temb_grid.safetensors")
+    SUFFIXES = ("adaln_proj.linear.weight", "norm_out.linear.weight")
+    _grid = None
+
+    def __init__(self, loader, embedder):
+        self.loader = loader
+        self.embedder = embedder
+        self._cached = None
+        self.pairs = [p for p in loader.lora_pairs if any(t[0].endswith(self.SUFFIXES) for t in p[2])]
+        loader.lora_pairs = [p for p in loader.lora_pairs if p not in self.pairs]
+        if self.pairs and _PrunedAdalnLoRA._grid is None:
+            if not os.path.isfile(self.GRID_PATH):
+                raise FileNotFoundError(f"LoRA has adaln weights for a pruned MiniMax-H3 but '{self.GRID_PATH}' is missing; install ComfyUI-MiniMax-H3-Turbo")
+            _PrunedAdalnLoRA._grid = comfy.utils.load_torch_file(self.GRID_PATH)["silu_t_emb_grid"].float()
+
+    def _silu_temb(self, device):
+        raw_t = self.embedder._raw_t
+        if self._cached is None or self._cached[0] is not raw_t:
+            t = raw_t.float().clamp(0.0, 1.0).cpu() * 1024.0
+            lo = t.long().clamp(0, 1023)
+            grid = _PrunedAdalnLoRA._grid
+            self._cached = (raw_t, torch.lerp(grid[lo], grid[lo + 1], (t - lo.float()).unsqueeze(-1)).to(device))
+        return self._cached[1]
+
+    def _patch(self, lin, key):
+        """Add this LoRA's delta to lin's forward; deltas of several LoRAs on the same projection accumulate."""
+        if not hasattr(lin, "_adaln_deltas"):
+            lin._adaln_deltas = {}
+            base_forward = lin.forward
+
+            def forward(x):
+                out = base_forward(x)
+                st = self._silu_temb(x.device)
+                for a, b in lin._adaln_deltas.values():
+                    out = out + (b.to(x.device, out.dtype) @ (a.to(x.device, out.dtype) @ st.to(out.dtype).T)).T
+                return out
+            lin.forward = forward
+        lin._adaln_deltas[id(self)] = key
+
+    def _factors(self, f, a_key, b_key):
+        a = self.loader._read_tensor(f, a_key, "cpu")
+        b = self.loader._read_tensor(f, b_key, "cpu")
+        scale = self.loader.scale
+        alpha_key = a_key.rsplit(".lora_A", 1)[0] + ".alpha"
+        if alpha_key in self.loader._header:
+            scale *= self.loader._read_tensor(f, alpha_key, "cpu").item() / a.size(0)
+        return a.bfloat16(), (b * scale).bfloat16()
+
+    def _apply(self, root, prefix):
+        with open(self.loader.lora_path, "rb") as f:
+            for a_key, b_key, targets in self.pairs:
+                for t_key, _ in targets:
+                    if t_key.startswith(prefix):
+                        lin = root.get_submodule(t_key[len(prefix):].removesuffix(".weight"))
+                        self._patch(lin, self._factors(f, a_key, b_key))
+
+    def apply_to_module(self, module, shard_name):
+        self.loader.apply_to_module(module, shard_name)
+        self._apply(module, shard_name.removeprefix("transformer.") + ".")
+
+    def patch_resident(self, transformer):
+        self._apply(transformer.norm_out, "norm_out.")
 
 
 # ---------------------------------------------------------------------------
@@ -312,13 +394,21 @@ class WeeLLMLoaderNode:
         if loras:
             from weellm.models.loras.lora_streamer import GenericLazyLoRALoader
             transformer = getattr(pipe._pipeline, "transformer", None) or pipe._pipeline.unet
-            transformer._weellm_streamer.lora_loader = _MultiLoRA([GenericLazyLoRALoader(path, scale=strength) for path, strength in loras])
+            loaders = [GenericLazyLoRALoader(path, scale=strength) for path, strength in loras]
+            if hasattr(getattr(transformer, "time_embedder", None), "table"):
+                loaders = [_PrunedAdalnLoRA(loader, transformer.time_embedder) for loader in loaders]
+                for loader in loaders:
+                    loader.patch_resident(transformer)
+            transformer._weellm_streamer.lora_loader = _MultiLoRA(loaders)
         return (pipe,)
 
 
 # ---------------------------------------------------------------------------
 # Node 2: WeeLLM Generate (Text-to-Image + Image-to-Image + Inpainting)
 # ---------------------------------------------------------------------------
+
+MAX_REFERENCE_IMAGES = 10
+
 
 class WeeLLMGenerateNode:
     """
@@ -346,6 +436,7 @@ class WeeLLMGenerateNode:
             "optional": {
                 "image":           ("IMAGE",),
                 "mask_image":      ("IMAGE",),
+                **{f"image_{i}": ("IMAGE", {"tooltip": "Extra reference image (models that accept several, e.g. Qwen Image 2.1 edit)"}) for i in range(2, MAX_REFERENCE_IMAGES + 1)},
             },
         }
 
@@ -353,7 +444,7 @@ class WeeLLMGenerateNode:
     FUNCTION = "generate"
     CATEGORY = "WeeLLM"
 
-    def generate(self, pipeline, prompt, height, width, num_steps, guidance_scale, image_guidance_scale, seed, strength, image=None, mask_image=None):
+    def generate(self, pipeline, prompt, height, width, num_steps, guidance_scale, image_guidance_scale, seed, strength, image=None, mask_image=None, **extra_images):
 
         pipe = pipeline
         pbar = comfy.utils.ProgressBar(num_steps)
@@ -375,7 +466,8 @@ class WeeLLMGenerateNode:
             call_kwargs["image_guidance_scale"] = image_guidance_scale
 
         if image is not None:
-            call_kwargs["image"] = _pil_from_comfy(image)
+            references = [_pil_from_comfy(image)] + [_pil_from_comfy(extra_images[f"image_{i}"]) for i in range(2, MAX_REFERENCE_IMAGES + 1) if extra_images.get(f"image_{i}") is not None]
+            call_kwargs["image"] = references if len(references) > 1 else references[0]
             call_kwargs["strength"] = strength
 
         if mask_image is not None:
@@ -547,7 +639,7 @@ class WeeLLMVideoGenerateNode:
             logging.warning("WeeLLM returned no audio; the audio output is silent.")
             waveform = torch.zeros(1, 2, int(sample_rate * frames_tensor.shape[0] / frame_rate))
 
-        gc.collect()
+        _release_gpu(pipe)
         _free_pipeline_cache()
         return (frames_tensor, {"waveform": waveform, "sample_rate": sample_rate}, None if latent is None else {"samples": latent})
 
@@ -581,13 +673,10 @@ class WeeLLMLatentDecodeNode:
     CATEGORY = "WeeLLM"
 
     def decode(self, pipeline, latent):
-        from weellm.io.memory import evict_module
+        comfy.model_management.unload_all_models()
+        _release_gpu(pipeline)
 
         underlying = pipeline._pipeline
-        transformer = underlying.transformer
-        evict_module(transformer)
-        transformer._weellm_streamer._resident_loaded = False
-
         streamer = underlying.vae_streamer
         config = streamer.model.config
         mean = torch.tensor(config.latents_mean).view(1, -1, 1, 1, 1)
@@ -598,7 +687,7 @@ class WeeLLMLatentDecodeNode:
         pixel_std = torch.tensor(underlying.pixel_std).view(1, -1, 1, 1, 1)
         frames = (video.float().cpu() * pixel_std + pixel_mean).clamp(0, 1)[0].permute(1, 2, 3, 0).contiguous()
 
-        gc.collect()
+        _release_gpu()
         _free_pipeline_cache()
         return (frames,)
 
