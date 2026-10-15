@@ -72,11 +72,13 @@ Responsible for configuring and building the model pipeline. The pipeline is reb
 - **`text_encoder_path`, `transformer_path`, `unet_path`, `vae_path`, `audio_vae_path`**: Weight overrides. Pass a full path or just a file name; names are looked up in `models/text_encoders`, `models/diffusion_models` and `models/vae`.
 - **`loras`**: A list built with [WeeLLM LoRA](#4-weellm-lora) nodes.
 - **`lora_weights` / `lora_scale`**: A single extra LoRA, kept for older workflows. A bare file name is looked up in `models/loras`.
+- Hugging Face downloads go to `models/diffusers` unless `HF_HUB_CACHE` is set.
 
 ### 2. WeeLLM Generate
 Generates images using the loaded pipeline.
 - Connect the `WEE_PIPELINE` from the Loader to this node.
 - Supports optional **`image`** and **`mask_image`** inputs for automatic Image-to-Image and Inpainting.
+- **`image_2` ... `image_10`**: extra reference images for models that take several (for example Qwen Image 2.1 edit). They are passed to the pipeline together with `image`.
 
 ### 3. WeeLLM Video Generate
 Generates video for models like MiniMax-H3 FL2VA.
@@ -90,6 +92,7 @@ Adds one LoRA from `models/loras` to a list. Chain as many as needed and connect
 - **`lora_name`** / **`strength`**: The LoRA file and its scale.
 - **`loras`** (optional): The list from a previous WeeLLM LoRA node.
 - LoRAs are applied in order while each block is streamed from disk, so every extra LoRA adds some time per block. WeeLLM skips (and warns about) LoRA keys that do not exist in the model, so use LoRAs trained for the loaded architecture.
+- Pruned MiniMax-H3 bases (`minimax_h3_fl2va_pruned-*`) keep a smaller `adaln_proj` than the one LoRAs such as the Turbo LoRA were trained on. For those the Loader applies the adaln part of the LoRA at run time, reading `h3_silu_temb_grid.safetensors` from the `ComfyUI-MiniMax-H3-Turbo` custom node, which must be installed.
 
 ### 5. WeeLLM Latent Decode
 Decodes a MiniMax-H3 `LATENT` into `frames` with the loaded pipeline's streamed VAE. Connect the same `WEE_PIPELINE` that produced the latent.
@@ -120,3 +123,13 @@ Preview with `decode_frames` on (use `frames` and `audio`). Once the video is as
 
 - WeeLLM has no refine pass, so this is the "quick preview" chain: the latent is enlarged and decoded, not re-sampled.
 - Decoding scales with the upscaled area: tiles grow roughly with the square of the scale. Each tile takes about 15 MB of pinned RAM plus about 22 MB once decoded, so a 209-frame video enlarged 1.5x needs roughly 9 GB of RAM and 2x more than 16 GB (estimates). Use a modest scale or fewer frames if RAM runs out.
+
+### Upscaling a finished video
+
+`upscale_video.py` enlarges an existing MP4 frame by frame with an upscale model from `models/upscale_models` and copies the audio unchanged. It does not need the WeeLLM pipeline. From the portable folder:
+
+```bash
+python_embeded\python.exe ComfyUI\custom_nodes\ComfyUI-WeeLLM\upscale_video.py ComfyUI\output\video\video.mp4
+```
+
+It writes `<video>_2x.mp4` next to the input. Options: `--model` (default `2x-AnimeSharpV4_Fast_RCAN_PU.safetensors`), `--output` and `--crf` (default 18). It sharpens edges but cannot fix text the video model already drew wrongly.
