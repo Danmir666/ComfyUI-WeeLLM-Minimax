@@ -133,7 +133,7 @@ def _diffusers_audio_vae(path):
 def _patch_gguf_prefix():
     """ComfyUI-style Flux.2 GGUFs prefix every tensor with 'model.diffusion_model.'; WeeLLM only detects the bare names and takes them for LongCat."""
     from weellm.io.ggufs import gguf_seek
-    from weellm.io.ggufs.keymaps.transformers.flux2 import Flux2KeyMap
+    from weellm.io.ggufs.keymaps.transformers.flux2 import Flux2GGUFKeyMap
     if getattr(gguf_seek, "_prefix_patched", False):
         return
     prefix = "model.diffusion_model."
@@ -141,7 +141,7 @@ def _patch_gguf_prefix():
 
     def build(gguf_keys, arch="unknown"):
         bare = [k.removeprefix(prefix) for k in gguf_keys]
-        if not Flux2KeyMap.detect(bare, arch):
+        if not Flux2GGUFKeyMap.detect(bare, arch):
             return build_remap_fn(gguf_keys, arch)
         remap, keymap_cls = build_remap_fn(bare, arch)
         return (lambda name: remap(name.removeprefix(prefix))), keymap_cls

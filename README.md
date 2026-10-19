@@ -8,7 +8,7 @@
 
 A native ComfyUI custom node wrapper for [WeeLLM](https://github.com/Jit-Roy/weellm) — bringing ultra-low VRAM layer-streaming inference directly into your Comfy workflows.
 
-With ComfyUI-WeeLLM, you can run massive diffusion models (like FLUX, Stable Diffusion, Stable Diffusion XL, Z image, Krea2, Qwen Image, Ltx2.5 and MiniMax-H3) on GPUs with **less than 4GB of VRAM**, without requiring to quantize. 
+With ComfyUI-WeeLLM, you can run massive diffusion models (like FLUX, Stable Diffusion, Stable Diffusion XL, Z image, Krea2, Qwen Image, MOSS-Image, Ltx2.5 and MiniMax-H3) on GPUs with **less than 4GB of VRAM**, without requiring to quantize. 
 
 - GGUFs and Safetensors - Everything is Supported.
 - LoRa Support Available.
@@ -59,6 +59,13 @@ Navigate to your `ComfyUI/custom_nodes/` directory and run:
 git clone https://github.com/Jit-Roy/ComfyUI-WeeLLM.git
 cd ComfyUI-WeeLLM
 pip install -r requirements.txt
+```
+
+### Updating WeeLLM
+
+New models (for example `OpenMOSS-Team/MOSS-Image-SFT`) land in WeeLLM first. `pip install -r requirements.txt` does not upgrade an already installed WeeLLM, so if a model fails with an error like `module diffusers has no attribute MOSSImageScheduler`, update it. For the portable build, from the portable folder:
+```bash
+python_embeded\python.exe -m pip install --upgrade --force-reinstall --no-deps git+https://github.com/Jit-Roy/weellm.git
 ```
 
 ## Nodes
