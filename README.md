@@ -77,6 +77,7 @@ Responsible for configuring and building the model pipeline. The pipeline is reb
 - **`dtype`**: The precision to use (e.g., `bfloat16`).
 - **`vram_budget` / `ram_budget`**: GB the streamer may use on the GPU and in system RAM. A larger `vram_budget` keeps more blocks cached on the GPU; a larger `ram_budget` prefetches more blocks from disk. `0` is a zero budget, not automatic.
 - **`text_encoder_path`, `transformer_path`, `unet_path`, `vae_path`, `audio_vae_path`**: Weight overrides. Pass a full path or just a file name; names are looked up in `models/text_encoders`, `models/diffusion_models` and `models/vae`.
+- **`negative_prompt`**: Sent to **WeeLLM Generate** when not empty. Only for models that take one (for example MOSS-Image); leave it empty for the rest.
 - **`loras`**: A list built with [WeeLLM LoRA](#4-weellm-lora) nodes.
 - **`lora_weights` / `lora_scale`**: A single extra LoRA, kept for older workflows. A bare file name is looked up in `models/loras`.
 - Hugging Face downloads go to `models/diffusers` unless `HF_HUB_CACHE` is set.

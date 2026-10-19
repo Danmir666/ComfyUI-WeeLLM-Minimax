@@ -357,6 +357,7 @@ class WeeLLMLoaderNode:
                 "lora_scale": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05}),
                 "vae_path": ("STRING", {"default": ""}),
                 "audio_vae_path": ("STRING", {"default": ""}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "Only for models that take one (e.g. MOSS-Image); leave empty otherwise"}),
                 "loras": ("WEE_LORAS",),
             }
         }
@@ -372,7 +373,7 @@ class WeeLLMLoaderNode:
 
     def load_pipeline(self, model_path, task, dtype, vram_budget=4.0, ram_budget=4.0, 
                       text_encoder_path="", transformer_path="", unet_path="", lora_weights="", lora_scale=1.0,
-                      vae_path="", audio_vae_path="", loras=None):
+                      vae_path="", audio_vae_path="", negative_prompt="", loras=None):
         torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[dtype]
 
         model_path = model_path.strip().strip('"')
@@ -409,6 +410,7 @@ class WeeLLMLoaderNode:
         if audio_vae_path: kwargs["audio_vae_path"] = _diffusers_audio_vae(_resolve_weights(audio_vae_path, "vae"))
 
         pipe = PipelineClass.from_pretrained(model_path, **kwargs)
+        pipe.negative_prompt = negative_prompt
 
         loras = list(loras or [])
         if lora_weights:
@@ -480,6 +482,9 @@ class WeeLLMGenerateNode:
 
         if height > 0: call_kwargs["height"] = height
         if width > 0: call_kwargs["width"] = width
+
+        if pipe.negative_prompt:
+            call_kwargs["negative_prompt"] = pipe.negative_prompt
 
         if guidance_scale >= 0.0:
             call_kwargs["guidance_scale"] = guidance_scale
