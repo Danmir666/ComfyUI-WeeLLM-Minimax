@@ -150,6 +150,83 @@ def _patch_gguf_prefix():
     gguf_seek._prefix_patched = True
 
 
+class _Qwen35GGUFKeyMap:
+    """llama.cpp Qwen3.5 GGUFs (MOSS-Image text encoder). WeeLLM only maps plain Llama names, which leaves the hybrid linear-attention layers and the embeddings unloaded."""
+    NAME = "qwen35-gguf"
+    _NAMES = {
+        "attn_norm.weight": "input_layernorm.weight",
+        "post_attention_norm.weight": "post_attention_layernorm.weight",
+        "ffn_gate.weight": "mlp.gate_proj.weight",
+        "ffn_up.weight": "mlp.up_proj.weight",
+        "ffn_down.weight": "mlp.down_proj.weight",
+        "attn_q.weight": "self_attn.q_proj.weight",
+        "attn_k.weight": "self_attn.k_proj.weight",
+        "attn_v.weight": "self_attn.v_proj.weight",
+        "attn_output.weight": "self_attn.o_proj.weight",
+        "attn_q_norm.weight": "self_attn.q_norm.weight",
+        "attn_k_norm.weight": "self_attn.k_norm.weight",
+        "attn_qkv.weight": "linear_attn.in_proj_qkv.weight",
+        "attn_gate.weight": "linear_attn.in_proj_z.weight",
+        "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
+        "ssm_beta.weight": "linear_attn.in_proj_b.weight",
+        "ssm_out.weight": "linear_attn.out_proj.weight",
+        "ssm_conv1d.weight": "linear_attn.conv1d.weight",
+        "ssm_dt.bias": "linear_attn.dt_bias",
+        "ssm_a": "linear_attn.A_log",
+        "ssm_norm.weight": "linear_attn.norm.weight",
+    }
+    _TOP = {"token_embd.weight": "language_model.embed_tokens.weight", "output_norm.weight": "language_model.norm.weight", "output.weight": "lm_head.weight"}
+    _NORMS_PLUS_ONE = ("input_layernorm.weight", "post_attention_layernorm.weight", "self_attn.q_norm.weight", "self_attn.k_norm.weight", "language_model.norm.weight")
+    K_HEADS, V_HEADS, HEAD_DIM = 16, 32, 128
+
+    @staticmethod
+    def detect(gguf_keys, arch):
+        return any(k.endswith(".ssm_conv1d.weight") for k in gguf_keys)
+
+    @classmethod
+    def build_remap(cls, gguf_keys):
+        remap = {}
+        for key in gguf_keys:
+            if key in cls._TOP:
+                remap[key] = [(cls._TOP[key], None)]
+                continue
+            _, layer, name = key.split(".", 2)
+            remap[key] = [(f"language_model.layers.{layer}.{cls._NAMES[name]}", None)]
+        return remap
+
+    @classmethod
+    def _untile(cls, x, dim, head_dim):
+        """llama.cpp lays the value heads out tiled (r, k); the HF checkpoint has them grouped (k, r)."""
+        r = cls.V_HEADS // cls.K_HEADS
+        x = x.movedim(dim, 0)
+        x = x.reshape(r, cls.K_HEADS, head_dim, *x.shape[1:]).transpose(0, 1).reshape(cls.V_HEADS * head_dim, *x.shape[1:])
+        return x.movedim(0, dim)
+
+    @classmethod
+    def postprocess_tensor(cls, key, t, orig_name):
+        value_rows = cls.V_HEADS * cls.HEAD_DIM
+        if key.endswith(cls._NORMS_PLUS_ONE):
+            return (t.float() - 1).to(t.dtype)
+        if key.endswith("in_proj_z.weight"):
+            return cls._untile(t, 0, cls.HEAD_DIM)
+        if key.endswith(("in_proj_qkv.weight", "conv1d.weight")):
+            t = torch.cat([t[:-value_rows], cls._untile(t[-value_rows:], 0, cls.HEAD_DIM)])
+            return t.unsqueeze(1) if key.endswith("conv1d.weight") else t
+        if key.endswith("out_proj.weight"):
+            return cls._untile(t, 1, cls.HEAD_DIM)
+        if key.endswith(("in_proj_a.weight", "in_proj_b.weight", "dt_bias")):
+            return cls._untile(t, 0, 1)
+        if key.endswith("A_log"):
+            return cls._untile((-t.float()).log().to(t.dtype), 0, 1)
+        return t
+
+
+def _patch_qwen35_gguf():
+    from weellm.io.ggufs import keymaps
+    if _Qwen35GGUFKeyMap not in keymaps._REGISTRY:
+        keymaps._REGISTRY.insert(0, _Qwen35GGUFKeyMap)
+
+
 def _free_pipeline_cache():
     """Drop ComfyUI's cached node outputs once the prompt ends; WeeLLM pipelines are single-use and keep GBs of host memory."""
     PromptServer.instance.prompt_queue.set_flag("free_memory", True)
@@ -395,6 +472,7 @@ class WeeLLMLoaderNode:
             raise ValueError(f"Unknown task: {task}")
 
         _patch_gguf_prefix()
+        _patch_qwen35_gguf()
 
         kwargs = {
             "torch_dtype": torch_dtype,

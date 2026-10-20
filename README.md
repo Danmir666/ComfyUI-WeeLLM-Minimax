@@ -105,6 +105,15 @@ Adds one LoRA from `models/loras` to a list. Chain as many as needed and connect
 ### 5. WeeLLM Latent Decode
 Decodes a MiniMax-H3 `LATENT` into `frames` with the loaded pipeline's streamed VAE. Connect the same `WEE_PIPELINE` that produced the latent.
 
+## MOSS-Image
+
+`OpenMOSS-Team/MOSS-Image-SFT` works by name, but WeeLLM then downloads every `*.safetensors` (about 26 GB). To run it from GGUFs instead:
+
+1. Download the configs of the repo (everything except the `text_encoder` and `transformer` weights, keep `vae/diffusion_pytorch_model.safetensors`) into a local folder such as `models/diffusers/moss-image-sft-config`, and use that folder as `model_path`.
+2. `transformer_path`: a MOSS-Image GGUF, for example `MOSS-Image-SFT-Q8_0.gguf` from [realrebelai/MOSS-Image_GGUFs](https://huggingface.co/realrebelai/MOSS-Image_GGUFs), in `models/diffusion_models`.
+3. `text_encoder_path`: a Qwen3.5-9B GGUF in `models/text_encoders`. WeeLLM has no key map for these, so the Loader registers one that undoes llama.cpp's changes (norm weights stored as `1 + w`, `A_log` stored as `-exp(A_log)`, reordered value heads, squeezed `conv1d`).
+4. The distilled 8-step LoRAs (for example `lodestones/MOSS-Image-SFT-8-steps-dmd`) go in the `loras` list as usual; use `num_steps = 8`.
+
 ## MiniMax-H3
 
 The MiniMax-H3 configs and tokenizer are bundled in `minimax_h3/`, so no Hugging Face repo is needed. Weights come from the usual ComfyUI folders.
