@@ -2,4 +2,4 @@
 # WeeLLM handles all core dependencies (diffusers, transformers, accelerate, safetensors etc).
 # We install directly from the GitHub repository.
 
-git+https://github.com/Jit-Roy/weellm.git
+git+https://github.com/Danmir666/WeeLLM.git@minimax-patches
