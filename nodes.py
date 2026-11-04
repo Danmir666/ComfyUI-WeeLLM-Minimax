@@ -7,10 +7,6 @@ import gc
 import shutil
 import textwrap
 
-# Reduces CUDA memory fragmentation — same flag used in native WeeLLM scripts.
-# Must be set before torch initialises the CUDA allocator.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 import torch
 import numpy as np
 from PIL import Image, ImageOps
@@ -36,6 +32,13 @@ def _pil_from_comfy(tensor):
     """Convert a ComfyUI IMAGE tensor [B,H,W,C] → PIL Image (first frame)."""
     np_img = (tensor[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
     return Image.fromarray(np_img, "RGB")
+
+
+def _limit_short_edge(img, short_edge):
+    scale = short_edge / min(img.size)
+    if scale >= 1:
+        return img
+    return img.resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS)
 
 
 def _comfy_from_pil(image: Image.Image):
@@ -106,6 +109,41 @@ def _diffusers_video_vae(path):
     return converted
 
 
+_QWEN_VAE_RESNET = {"0": "norm1", "2": "conv1", "3": "norm2", "6": "conv2"}
+_QWEN_VAE_HEAD = {"0": "norm_out", "2": "conv_out"}
+
+
+def _qwen_vae_key(key):
+    key = re.sub(r"^conv1\.", "quant_conv.", key)
+    key = re.sub(r"^conv2\.", "post_quant_conv.", key)
+    key = re.sub(r"^(encoder|decoder)\.conv1\.", r"\1.conv_in.", key)
+    key = re.sub(r"^(encoder|decoder)\.head\.(\d)\.", lambda m: f"{m[1]}.{_QWEN_VAE_HEAD[m[2]]}.", key)
+    key = re.sub(r"\.middle\.(0|2)\.residual\.(\d)\.", lambda m: f".mid_block.resnets.{int(m[1]) // 2}.{_QWEN_VAE_RESNET[m[2]]}.", key)
+    key = key.replace(".middle.1.", ".mid_block.attentions.0.")
+    key = re.sub(r"\.(down|up)samples\.(\d+)\.\1samples\.(\d+)\.residual\.(\d)\.", lambda m: f".{m[1]}_blocks.{m[2]}.resnets.{m[3]}.{_QWEN_VAE_RESNET[m[4]]}.", key)
+    key = re.sub(r"\.(down|up)samples\.(\d+)\.\1samples\.(\d+)\.shortcut\.", lambda m: f".{m[1]}_blocks.{m[2]}.resnets.{m[3]}.conv_shortcut.", key)
+    return re.sub(r"\.(down|up)samples\.(\d+)\.\1samples\.\d+\.(resample|time_conv)\.", lambda m: f".{m[1]}_blocks.{m[2]}.{m[1]}sampler.{m[3]}.", key)
+
+
+def _diffusers_qwen_vae(path):
+    """Qwen-Image 2.1 VAEs shared as ComfyUI/Wan-layout files (e.g. the texture-fix VAE); convert once to the diffusers layout WeeLLM loads."""
+    with safe_open(path, "pt") as f:
+        if "decoder.head.0.gamma" not in f.keys() or "decoder.mask_token" in f.keys():
+            return path
+        converted = os.path.splitext(path)[0] + "_diffusers.safetensors"
+        if os.path.exists(converted):
+            return converted
+        state = {}
+        for key in f.keys():
+            tensor = f.get_tensor(key)
+            if tensor.ndim == 5 and tensor.shape[2] == 1:
+                tensor = tensor.squeeze(2)
+            state[_qwen_vae_key(key)] = tensor.contiguous()
+        save_file(state, converted + ".tmp", metadata={"format": "pt"})
+    os.replace(converted + ".tmp", converted)
+    return converted
+
+
 def _diffusers_audio_vae(path):
     """The unsloth MiniMax-H3 audio VAE ships fused conv weights; the model expects weight_norm's weight_g/weight_v."""
     with safe_open(path, "pt") as f:
@@ -131,9 +169,10 @@ def _diffusers_audio_vae(path):
 
 
 def _patch_gguf_prefix():
-    """ComfyUI-style Flux.2 GGUFs prefix every tensor with 'model.diffusion_model.'; WeeLLM only detects the bare names and takes them for LongCat."""
+    """ComfyUI-style Flux.2 and Qwen-Image-2.1 GGUFs prefix every tensor with 'model.diffusion_model.'; WeeLLM only detects the bare names and takes them for LongCat or SDXL."""
     from weellm.io.ggufs import gguf_seek
     from weellm.io.ggufs.keymaps.transformers.flux2 import Flux2GGUFKeyMap
+    from weellm.io.ggufs.keymaps.transformers.qwen_image_21 import QwenImage21GGUFKeyMap
     if getattr(gguf_seek, "_prefix_patched", False):
         return
     prefix = "model.diffusion_model."
@@ -141,7 +180,7 @@ def _patch_gguf_prefix():
 
     def build(gguf_keys, arch="unknown"):
         bare = [k.removeprefix(prefix) for k in gguf_keys]
-        if not Flux2GGUFKeyMap.detect(bare, arch):
+        if not (Flux2GGUFKeyMap.detect(bare, arch) or QwenImage21GGUFKeyMap.detect(bare, arch)):
             return build_remap_fn(gguf_keys, arch)
         remap, keymap_cls = build_remap_fn(bare, arch)
         return (lambda name: remap(name.removeprefix(prefix))), keymap_cls
@@ -227,6 +266,13 @@ def _patch_qwen35_gguf():
         keymaps._REGISTRY.insert(0, _Qwen35GGUFKeyMap)
 
 
+def _use_qwen21_turbo_schedule(pipeline):
+    """The Turbo repo ships its own 8-step sigmas and a scheduler without dynamic shifting; the base Qwen-Image-2.1 folder has neither, so the GGUF would be sampled on the wrong schedule."""
+    from diffusers import FlowMatchEulerDiscreteScheduler
+    pipeline.register_to_config(sample_sigmas=[1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568])
+    pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipeline.scheduler.config, use_dynamic_shifting=False, shift_terminal=None)
+
+
 def _free_pipeline_cache():
     """Drop ComfyUI's cached node outputs once the prompt ends; WeeLLM pipelines are single-use and keep GBs of host memory."""
     PromptServer.instance.prompt_queue.set_flag("free_memory", True)
@@ -248,7 +294,7 @@ _decode_capture = {"active": False, "skip": False, "latent": None}
 
 
 def _patch_vae_decode():
-    """MiniMax VAE decode on 6 GB cards: size micro-batches for the real per-tile cost (~14x, WeeLLM assumes ~5x) and stitch the decoded tiles in RAM instead of VRAM."""
+    """MiniMax VAE decode on 6 GB cards: size micro-batches for the real per-tile cost (~18x, WeeLLM assumes ~5x) and stitch the decoded tiles in RAM instead of VRAM. The tile batch stays in pageable RAM: pinning several GB fails with a CUDA OOM at high resolutions."""
     from weellm.models.vaes.autoencoder_kl_minimax_h3 import AutoencoderKLMiniMaxH3Streamer
     module = sys.modules[AutoencoderKLMiniMaxH3Streamer.__module__]
     if getattr(AutoencoderKLMiniMaxH3Streamer, "_decode_patched", False):
@@ -260,7 +306,7 @@ def _patch_vae_decode():
         stream_decode = AutoencoderKLMiniMaxH3Streamer._stream_decode
     else:
         namespace = {}
-        exec(source.replace(gpu_tiles, "t.unsqueeze(0) for t in all_hs.unbind(dim=0)"), vars(module), namespace)
+        exec(source.replace(gpu_tiles, "t.unsqueeze(0) for t in all_hs.unbind(dim=0)").replace(".pin_memory()", ""), vars(module), namespace)
         stream_decode = namespace["_stream_decode"]
 
     def _stream_decode(self, z):
@@ -269,8 +315,10 @@ def _patch_vae_decode():
 
         def capped(*args, **kwargs):
             free, total = mem_get_info(*args, **kwargs)
-            return reserve + max(0, free - reserve) * 5 / 14, total
+            return reserve + max(0, free - reserve) * 5 / 18, total
 
+        gc.collect()
+        torch.cuda.empty_cache()
         torch.cuda.mem_get_info = capped
         try:
             return stream_decode(self, z)
@@ -292,6 +340,43 @@ def _patch_vae_decode():
     AutoencoderKLMiniMaxH3Streamer._stream_decode = _stream_decode
     AutoencoderKLMiniMaxH3Streamer.decode = capture_decode
     AutoencoderKLMiniMaxH3Streamer._decode_patched = True
+
+
+class _RefModReferences(list):
+    """Ref2VA references decoded from RefMod latents; `latents` holds the saved latent of each, in the same order."""
+    def __init__(self, references, latents):
+        super().__init__(references)
+        self.latents = latents
+
+
+# Saved RefMod latents of the visual references of the running video generation; empty when they are all encoded from pixels
+_refmod_latents = []
+
+
+def _patch_ref2va_encoder():
+    """Hand the saved RefMod latents to the Ref2VA reference encoder instead of re-encoding the pixels decoded from them."""
+    from diffusers.modular_pipelines.minimax_h3 import encoders
+    step = encoders.MiniMaxH3Ref2VAReferenceEncoderStep
+    if getattr(step, "_refmod_patched", False):
+        return
+    call = step.__call__
+    encode = encoders.encode_vae_condition
+
+    def refmod_call(self, components, state):
+        latents = iter(_refmod_latents)
+
+        def encode_vae_condition(*args, **kwargs):
+            latent = next(latents, None)
+            return encode(*args, **kwargs) if latent is None else latent
+
+        encoders.encode_vae_condition = encode_vae_condition
+        try:
+            return call(self, components, state)
+        finally:
+            encoders.encode_vae_condition = encode
+
+    step.__call__ = refmod_call
+    step._refmod_patched = True
 
 
 def _make_step_callback(pbar: comfy.utils.ProgressBar):
@@ -436,6 +521,7 @@ class WeeLLMLoaderNode:
                 "audio_vae_path": ("STRING", {"default": ""}),
                 "negative_prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "Only for models that take one (e.g. MOSS-Image); leave empty otherwise"}),
                 "loras": ("WEE_LORAS",),
+                "ref2va": ("BOOLEAN", {"default": False, "tooltip": "transformer_path is a minimax_h3_ref2va_pruned-*.gguf. Use it with the references input of WeeLLM Video Generate"}),
             }
         }
 
@@ -450,7 +536,7 @@ class WeeLLMLoaderNode:
 
     def load_pipeline(self, model_path, task, dtype, vram_budget=4.0, ram_budget=4.0, 
                       text_encoder_path="", transformer_path="", unet_path="", lora_weights="", lora_scale=1.0,
-                      vae_path="", audio_vae_path="", negative_prompt="", loras=None):
+                      vae_path="", audio_vae_path="", negative_prompt="", loras=None, ref2va=False):
         torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[dtype]
 
         model_path = model_path.strip().strip('"')
@@ -484,11 +570,15 @@ class WeeLLMLoaderNode:
         if text_encoder_path: kwargs["text_encoder_path"] = _resolve_weights(text_encoder_path, "text_encoders")
         if transformer_path: kwargs["transformer_path"] = _resolve_weights(transformer_path, "diffusion_models")
         if unet_path: kwargs["unet_path"] = _resolve_weights(unet_path, "diffusion_models")
-        if vae_path: kwargs["vae_path"] = _diffusers_video_vae(_resolve_weights(vae_path, "vae"))
+        if vae_path: kwargs["vae_path"] = _diffusers_qwen_vae(_diffusers_video_vae(_resolve_weights(vae_path, "vae")))
         if audio_vae_path: kwargs["audio_vae_path"] = _diffusers_audio_vae(_resolve_weights(audio_vae_path, "vae"))
 
         pipe = PipelineClass.from_pretrained(model_path, **kwargs)
         pipe.negative_prompt = negative_prompt
+        if "qwen-image-2.1-turbo" in os.path.basename(transformer_path).lower():
+            _use_qwen21_turbo_schedule(pipe._pipeline)
+        if ref2va:
+            pipe._pipeline.register_components(transformer_ref=pipe._pipeline.transformer)
 
         loras = list(loras or [])
         if lora_weights:
@@ -538,6 +628,7 @@ class WeeLLMGenerateNode:
             "optional": {
                 "image":           ("IMAGE",),
                 "mask_image":      ("IMAGE",),
+                "reference_short_edge": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 32, "tooltip": "Reference images with a shorter edge are scaled down to this before they are encoded; smaller images are left as they are. Lower it if the text encoder runs out of memory."}),
                 **{f"image_{i}": ("IMAGE", {"tooltip": "Extra reference image (models that accept several, e.g. Qwen Image 2.1 edit)"}) for i in range(2, MAX_REFERENCE_IMAGES + 1)},
             },
         }
@@ -546,7 +637,7 @@ class WeeLLMGenerateNode:
     FUNCTION = "generate"
     CATEGORY = "WeeLLM"
 
-    def generate(self, pipeline, prompt, height, width, num_steps, guidance_scale, image_guidance_scale, seed, strength, image=None, mask_image=None, **extra_images):
+    def generate(self, pipeline, prompt, height, width, num_steps, guidance_scale, image_guidance_scale, seed, strength, image=None, mask_image=None, reference_short_edge=1024, **extra_images):
 
         pipe = pipeline
         pbar = comfy.utils.ProgressBar(num_steps)
@@ -571,7 +662,7 @@ class WeeLLMGenerateNode:
             call_kwargs["image_guidance_scale"] = image_guidance_scale
 
         if image is not None:
-            references = [_pil_from_comfy(image)] + [_pil_from_comfy(extra_images[f"image_{i}"]) for i in range(2, MAX_REFERENCE_IMAGES + 1) if extra_images.get(f"image_{i}") is not None]
+            references = [_limit_short_edge(_pil_from_comfy(img), reference_short_edge) for img in [image] + [extra_images[f"image_{i}"] for i in range(2, MAX_REFERENCE_IMAGES + 1) if extra_images.get(f"image_{i}") is not None]]
             call_kwargs["image"] = references if len(references) > 1 else references[0]
             call_kwargs["strength"] = strength
 
@@ -629,6 +720,8 @@ class WeeLLMVideoGenerateNode:
             "optional": {
                 "first_frame": ("IMAGE",),   # first frame
                 "last_frame":  ("IMAGE",),   # last frame (MiniMax FL2VA)
+                "references":  ("WEE_REFERENCES",),   # MiniMax Ref2VA, needs a Loader with ref2va on
+                "reference_short_edge": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 32, "tooltip": "Short edge every reference image is resized to before it is encoded (MiniMax-H3 uses 2048). Lower it if the text encoder runs out of memory."}),
                 "frame_rate":  ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 1.0}),
                 "decode_frames": ("BOOLEAN", {"default": True, "tooltip": "Chooses ONE output, never both (outputting both can run out of memory).\nOn: decodes the video. Use frames (and audio) to preview or save it; latent stays empty.\nOff: skips the slow VAE decode. Use latent with the H3 Latent Upscaler and WeeLLM Latent Decode to scale the video; frames is then a 1-frame placeholder.\nSwitching modes runs the generation again (same seed, same prompt)."}),
                 "audio_guidance_scale": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 30.0, "step": 0.1}),
@@ -645,7 +738,7 @@ class WeeLLMVideoGenerateNode:
     CATEGORY = "WeeLLM"
 
     def generate(self, pipeline, prompt, height, width, num_frames, num_steps, seed,
-                 first_frame=None, last_frame=None, frame_rate=24.0, audio_guidance_scale=-1.0,
+                 first_frame=None, last_frame=None, references=None, reference_short_edge=512, frame_rate=24.0, audio_guidance_scale=-1.0,
                  stg_scale=-1.0, audio_stg_scale=-1.0, modality_scale=-1.0, audio_modality_scale=-1.0,
                  decode_frames=True):
 
@@ -668,6 +761,13 @@ class WeeLLMVideoGenerateNode:
         if last_frame is not None:
             call_kwargs["last_image"] = _pil_from_comfy(last_frame)
             
+        if references:
+            call_kwargs["references"] = references
+            pipe._pipeline.register_to_config(reference_image_short_edge=reference_short_edge)
+            if isinstance(references, _RefModReferences):
+                _patch_ref2va_encoder()
+                _refmod_latents[:] = references.latents
+
         if audio_guidance_scale >= 0: call_kwargs["audio_guidance_scale"] = audio_guidance_scale
         if stg_scale >= 0: call_kwargs["stg_scale"] = stg_scale
         if audio_stg_scale >= 0: call_kwargs["audio_stg_scale"] = audio_stg_scale
@@ -689,6 +789,7 @@ class WeeLLMVideoGenerateNode:
             raise
         finally:
             _decode_capture["active"] = False
+            _refmod_latents.clear()
         latent = _decode_capture["latent"]
         if latent is None and not decode_frames:
             raise ValueError("No video latent was captured; latent output needs the bundled MiniMax-H3 setup (empty model_path)")
@@ -751,6 +852,92 @@ class WeeLLMVideoGenerateNode:
 
 
 # ---------------------------------------------------------------------------
+# Node: WeeLLM H3 References (MiniMax-H3 Ref2VA)
+# ---------------------------------------------------------------------------
+
+class WeeLLMH3ReferencesNode:
+    """
+    Builds the ordered reference list for MiniMax-H3 Ref2VA: every image of
+    `images` first (<Picture 1>, <Picture 2>...), then the video, then the audio.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "images": ("IMAGE", {"tooltip": "Each image of the batch is one picture reference (up to 9)"}),
+                "video": ("IMAGE", {"tooltip": "Frames of one video reference"}),
+                "video_fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 1.0, "tooltip": "Real frame rate of video; it is resampled to 24 fps"}),
+                "audio": ("AUDIO", {"tooltip": "Voice or music reference; needs at least one image or video"}),
+            },
+        }
+
+    RETURN_TYPES = ("WEE_REFERENCES",)
+    RETURN_NAMES = ("references",)
+    FUNCTION = "build"
+    CATEGORY = "WeeLLM"
+
+    def build(self, images=None, video=None, video_fps=24.0, audio=None):
+        from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3AudioReference, MiniMaxH3ImageReference, MiniMaxH3VideoReference
+
+        references = []
+        if images is not None:
+            references += [MiniMaxH3ImageReference(image=_pil_from_comfy(image[None])) for image in images]
+        if video is not None:
+            frames = (video.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            references.append(MiniMaxH3VideoReference(frames=frames, fps=video_fps))
+        if audio is not None:
+            references.append(MiniMaxH3AudioReference(audio=audio["waveform"][0].float().cpu(), sample_rate=audio["sample_rate"]))
+        return (references,)
+
+
+class WeeLLMH3RefModReferencesNode:
+    """
+    Builds MiniMax-H3 Ref2VA references from the mods of ComfyUI-MiniMaxH3Mod's Load H3 RefMods. The saved latents go to
+    the transformer as they are, scaled by each slot's strength; only the Qwen conditioner gets pixels, decoded from the
+    same latents with the H3 video VAE.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mods": ("H3_REF_MODS",),
+                "vae": ("VAE", {"tooltip": "H3 video VAE in ComfyUI's original layout (not the _diffusers file WeeLLM writes). It decodes the latents for the text encoder"}),
+            },
+            "optional": {
+                "video_fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 1.0, "tooltip": "Frame rate of the decoded video RefMods; saved latents do not keep the original timing"}),
+            },
+        }
+
+    RETURN_TYPES = ("WEE_REFERENCES",)
+    RETURN_NAMES = ("references",)
+    FUNCTION = "build"
+    CATEGORY = "WeeLLM"
+
+    def build(self, mods, vae, video_fps=24.0):
+        from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3ImageReference, MiniMaxH3VideoReference
+
+        references, latents = [], []
+        for mod, strength in mods:
+            block = mod.ref_block(strength)
+            if block is None:
+                continue
+            if block["kind"] == "audio":
+                raise ValueError("Audio RefMods are not supported by WeeLLM; set components to Visual in Load H3 RefMods")
+            pixels = vae.decode(block["latent"])
+            if pixels.ndim == 5:
+                pixels = pixels[0]
+            if block["kind"] == "image":
+                references.append(MiniMaxH3ImageReference(image=_pil_from_comfy(pixels[:1])))
+            else:
+                references.append(MiniMaxH3VideoReference(frames=(pixels.cpu().numpy() * 255).clip(0, 255).astype(np.uint8), fps=video_fps))
+            latents.append(block["latent"].float().cpu())
+        return (_RefModReferences(references, latents),)
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -803,6 +990,8 @@ NODE_CLASS_MAPPINGS = {
     "WeeLLMGenerateNode":      WeeLLMGenerateNode,
     "WeeLLMVideoGenerateNode": WeeLLMVideoGenerateNode,
     "WeeLLMLatentDecodeNode":  WeeLLMLatentDecodeNode,
+    "WeeLLMH3ReferencesNode":  WeeLLMH3ReferencesNode,
+    "WeeLLMH3RefModReferencesNode": WeeLLMH3RefModReferencesNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -811,4 +1000,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WeeLLMGenerateNode":      "WeeLLM Generate",
     "WeeLLMVideoGenerateNode": "WeeLLM Video Generate",
     "WeeLLMLatentDecodeNode":  "WeeLLM Latent Decode",
+    "WeeLLMH3ReferencesNode":  "WeeLLM H3 References",
+    "WeeLLMH3RefModReferencesNode": "WeeLLM H3 RefMod References",
 }

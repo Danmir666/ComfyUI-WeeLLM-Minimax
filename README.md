@@ -129,8 +129,14 @@ The MiniMax-H3 configs and tokenizer are bundled in `minimax_h3/`, so no Hugging
 
 - The unsloth VAEs use the original MiniMax key layout. On first use they are converted next to the original as `*_diffusers.safetensors` (about 5.8 GB in total) and reused afterwards. The originals can be deleted once the converted files exist; point the Loader at the `_diffusers` names.
 - ComfyUI-native quantized checkpoints (for example W4A8 `blocks.N.attn.qkv_proj` files) cannot be loaded by WeeLLM. Use the GGUF transformers.
-- On cards with 6 GB of VRAM the Loader patches WeeLLM's MiniMax VAE decode in memory: micro-batches are sized for the real per-tile cost (~14x a tile's bytes, WeeLLM assumes ~5x) and the decoded tiles are stitched in system RAM instead of VRAM. This needs a few GB of free RAM while the video is assembled. If a future WeeLLM release changes that code, the patch is skipped and a warning is logged.
+- On cards with 6 GB of VRAM the Loader patches WeeLLM's MiniMax VAE decode in memory: micro-batches are sized for the real per-tile cost (~18x a tile's bytes, WeeLLM assumes ~5x) and the decoded tiles are stitched in system RAM instead of VRAM. This needs a few GB of free RAM while the video is assembled. If a future WeeLLM release changes that code, the patch is skipped and a warning is logged.
 - The Generate nodes ask ComfyUI to free its node cache when a prompt ends, because a WeeLLM pipeline keeps several GB of host memory and cannot be reused. Other cached nodes in the workflow run again on the next queue.
+
+### Ref2VA (reference images, video and audio)
+
+Use `minimax_h3_ref2va_pruned-*.gguf` as `transformer_path` and turn on `ref2va` in the Loader; everything else is the same as above. Connect **WeeLLM H3 References** (`images`, `video` + `video_fps`, `audio`) to the `references` input of `WeeLLM Video Generate`. References are read in the order images, video, audio, so the prompt can mention `<Picture 1>`, `<Video 1>` and `<Audio 1>`. An audio reference needs at least one image or video. `first_frame` and `last_frame` are not used with references.
+
+**RefMod references.** `WeeLLM H3 RefMod References` takes the `mods` of ComfyUI-MiniMaxH3Mod's `Load H3 RefMods` (visual only) and a ComfyUI H3 video VAE in the original layout (not the `_diffusers` file), and feeds `references` of `WeeLLM Video Generate` like `WeeLLM H3 References`. The saved latents reach the transformer scaled by each slot's strength; the text encoder sees pixels decoded from them. `Apply H3 RefMod`, `Step Curve` and `retention` have no effect here.
 
 ### Latent upscaling with the H3 Latent Upscaler
 

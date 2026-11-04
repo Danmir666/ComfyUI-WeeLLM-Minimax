@@ -4,13 +4,9 @@ ComfyUI-WeeLLM install.py
 Two one-time setup tasks run transparently on Windows:
 
 1. Triton tcc headers — copies Python C headers into tcc's include directory
-   so torch.compile can compile CUDA kernels (needed for memory-efficient VAE
-   decoding on low-VRAM GPUs).
+   so torch.compile can compile CUDA kernels.
 
-2. PYTORCH_CUDA_ALLOC_CONF — sets expandable_segments:True in the user's
-   Windows environment so PyTorch initialises its CUDA allocator without
-   memory fragmentation, preventing OOM errors during LoRA delta computation.
-   Takes effect on the next ComfyUI restart (one-time prompt to user).
+2. Disable cudaMallocAsync via a site-packages .pth file.
 
 Both are no-ops on Linux / macOS and on every run after the first.
 """
@@ -25,10 +21,6 @@ import tempfile
 from pathlib import Path
 
 log = logging.getLogger("ComfyUI-WeeLLM")
-
-_ALLOC_KEY   = "PYTORCH_CUDA_ALLOC_CONF"
-_ALLOC_VALUE = "expandable_segments:True"
-
 
 # ---------------------------------------------------------------------------
 # 1.  Triton tcc header fix
@@ -96,69 +88,6 @@ def setup_triton_headers():
 
 
 # ---------------------------------------------------------------------------
-# 2.  PYTORCH_CUDA_ALLOC_CONF — persistent Windows env var via registry
-# ---------------------------------------------------------------------------
-
-def _get_user_env_var(name):
-    """Read a value from HKCU\\Environment (returns None if missing)."""
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ)
-        value, _ = winreg.QueryValueEx(key, name)
-        winreg.CloseKey(key)
-        return value
-    except Exception:
-        return None
-
-
-def _set_user_env_var(name, value):
-    """Write a value to HKCU\\Environment so it persists across reboots."""
-    import winreg
-    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE)
-    winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
-    winreg.CloseKey(key)
-
-
-def setup_cuda_alloc_conf():
-    """
-    Ensure PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is set for all
-    future Python processes on this machine.
-
-    Because ComfyUI imports torch before custom nodes load, we cannot affect
-    the CURRENT process. We write the value to the Windows user environment
-    registry so it is inherited by every new process — including the next
-    ComfyUI startup — and show a one-time restart notice to the user.
-    """
-    if os.name != "nt":
-        # On Linux/macOS the user sets this in their launch script; skip.
-        return
-
-    current = _get_user_env_var(_ALLOC_KEY)
-    if current == _ALLOC_VALUE:
-        return  # Already set from a previous run — nothing to do.
-
-    try:
-        _set_user_env_var(_ALLOC_KEY, _ALLOC_VALUE)
-        log.warning(
-            "[WeeLLM] \n"
-            "  ╔══════════════════════════════════════════════════════════════╗\n"
-            "  ║  WeeLLM: One-time setup complete — RESTART REQUIRED         ║\n"
-            "  ║                                                              ║\n"
-            "  ║  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True has been  ║\n"
-            "  ║  saved to your Windows environment. This prevents VRAM OOM  ║\n"
-            "  ║  errors when using LoRA with low-VRAM GPUs.                 ║\n"
-            "  ║                                                              ║\n"
-            "  ║  Please restart ComfyUI once for this to take effect.       ║\n"
-            "  ╚══════════════════════════════════════════════════════════════╝"
-        )
-    except Exception as exc:
-        log.warning(
-            "[WeeLLM] Could not set PYTORCH_CUDA_ALLOC_CONF automatically (%s). "
-            "For best results on low-VRAM GPUs, add "
-            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to your system environment variables.",
-            exc,
-        )
-# ---------------------------------------------------------------------------
 # 3.  Disable cudaMallocAsync via Python .pth file
 # ---------------------------------------------------------------------------
 
@@ -202,5 +131,4 @@ def setup_disable_cuda_malloc():
 
 if __name__ == "__main__":
     setup_triton_headers()
-    setup_cuda_alloc_conf()
     setup_disable_cuda_malloc()
